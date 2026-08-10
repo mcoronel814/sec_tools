@@ -18,12 +18,33 @@ git clone https://github.com/mcoronel814/sec_tools.git sec_tools
 cd sec_tools
 ```
 
-Optional (only needed for VirusTotal lookups):
+### VirusTotal setup (only needed for `get_sha256.py`)
+
+1. Install the HTTP library once (if you do not already have it):
 
 ```bash
 pip install requests
-export VT_API_KEY='your_virustotal_api_key'   # see .env.example
 ```
+
+2. Create a local `.env` file with your API key (**recommended** — one-time setup):
+
+```bash
+cp .env.example .env
+```
+
+3. Open `.env` in an editor and replace the placeholder with your real key:
+
+```bash
+# .env  (this file is gitignored)
+VT_API_KEY=paste_your_real_key_here
+```
+
+Get a key from: https://www.virustotal.com/gui/my-apikey
+
+**Note:** `export VT_API_KEY='...'` only sets the key for **that terminal session**.  
+It does **not** create a `.env` file. Prefer `.env` so you do not have to export every time.
+
+`get_sha256.py` automatically reads `.env` from the current directory or the script’s folder.
 
 ## Working data files (not in git)
 
@@ -77,15 +98,15 @@ Rewrites the file in place with unique, lowercased first-tokens.
 
 ### VirusTotal hash → SHA-256
 
+Prerequisite: `.env` with `VT_API_KEY=...` (see setup above), or `export VT_API_KEY='...'` in the current shell.
+
 ```bash
-export VT_API_KEY='...'
-# edit sha1_list.txt, then:
+# edit sha1_list.txt (one hash per line), then:
 python3 get_sha256.py
 python3 get_sha256.py path/to/hashes.txt
 ```
 
-Requires a [VirusTotal API key](https://www.virustotal.com/gui/my-apikey).  
-**Never commit API keys.** Prefer environment variables (see `.env.example`).
+**Never commit API keys** (`.env` is gitignored).
 
 ## Repository layout
 
@@ -93,7 +114,8 @@ Requires a [VirusTotal API key](https://www.virustotal.com/gui/my-apikey).
 sec_tools/
 ├── README.md
 ├── .gitignore
-├── .env.example
+├── .env.example            # template for VT_API_KEY
+├── .env                    # your API key (gitignored — create with: cp .env.example .env)
 ├── email_header_spoofing_analyzer.py
 ├── ioc_txt_trimmer.py
 ├── get_sha256.py
