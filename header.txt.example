@@ -1,0 +1,8 @@
+Received: from mail.example.com ([203.0.113.10]) by mx.example.org; Mon, 1 Jan 2024 12:00:00 +0000
+Authentication-Results: mx.example.org; spf=pass smtp.mailfrom=user@example.com; dkim=pass header.i=@example.com; dmarc=pass (p=none) d=example.com
+From: user@example.com
+To: you@your-org.example
+Subject: Example message (replace this file with a real header dump)
+Return-Path: <user@example.com>
+Date: Mon, 1 Jan 2024 12:00:00 +0000
+Message-ID: <example@example.com>
