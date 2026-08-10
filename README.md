@@ -14,7 +14,7 @@ Python 3, run from a terminal; most tools read **local text files you create** (
 ## Setup
 
 ```bash
-git clone <your-repo-url> sec_tools
+git clone https://github.com/mcoronel814/sec_tools.git sec_tools
 cd sec_tools
 ```
 
