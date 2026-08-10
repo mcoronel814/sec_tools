@@ -20,10 +20,13 @@ cd sec_tools
 
 ### VirusTotal setup (only needed for `get_sha256.py`)
 
-1. Install the HTTP library once (if you do not already have it):
+The header analyzer and IOC trimmer need **no** pip packages.  
+`get_sha256.py` needs `requests` (listed in `requirements.txt`).
+
+1. Install dependencies once:
 
 ```bash
-pip install requests
+pip install -r requirements.txt
 ```
 
 2. Create a local `.env` file with your API key (**recommended** — one-time setup):
@@ -113,6 +116,7 @@ python3 get_sha256.py path/to/hashes.txt
 ```
 sec_tools/
 ├── README.md
+├── requirements.txt        # pip deps (requests for VirusTotal helper)
 ├── .gitignore
 ├── .env.example            # template for VT_API_KEY
 ├── .env                    # your API key (gitignored — create with: cp .env.example .env)
