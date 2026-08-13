@@ -8,7 +8,7 @@ Python 3, run from a terminal; most tools read **local text files you create** (
 | Script | Purpose | Default input |
 |--------|---------|----------------|
 | `email_header_spoofing_analyzer.py` | Offline email-header triage (SPF/DKIM/DMARC, identity, path, gateway signals) | `header.txt` |
-| `ioc_txt_trimmer.py` | Clean IOC lists (first token, lowercase, dedupe, in-place) | `ioc.txt` |
+| `ioc_txt_trimmer.py` | Prep mixed IOCs for Netskope / Check Point (clean, collapse URLs to hosts, protect shared sites) | `ioc.txt` |
 | `get_sha256.py` | Resolve hashes to SHA-256 via VirusTotal | `sha1_list.txt` |
 
 ## Setup
@@ -91,13 +91,121 @@ The **ANALYST TAKEAWAY** section recommends `BLOCK`, `QUARANTINE`, `INVESTIGATE`
 
 ### IOC list trimmer
 
+**Who this is for:** you pasted hashes, IPs, domains, and URLs from threat reports into one messy list, and you need a clean list to load into **Netskope** or **Check Point** — without blocking all of Google, Telegram, or a URL shortener.
+
+No programming needed. You only edit a text file and run one command.
+
+#### 1. Create your working file (once)
+
 ```bash
-# edit ioc.txt, then:
-python3 ioc_txt_trimmer.py
-python3 ioc_txt_trimmer.py path/to/other_iocs.txt
+cp ioc.txt.example ioc.txt
 ```
 
-Rewrites the file in place with unique, lowercased first-tokens.
+#### 2. Paste IOCs into `ioc.txt`
+
+One item per line is best. Extra notes after the IOC are OK — they get dropped. Example of a messy paste from reports:
+
+```text
+0d46907320ab55d98966389f41441aa0341a7db829cd166748d8929d466c9fba  malware sample
+192.64.119.211
+smartviewdevices.com
+https://evil-cdn.bad-example.com/payload.exe?id=123
+http://zokrie.click:4536/gate
+http://abc123.attacker.workers.dev/api/session/status/dev_111
+http://abc123.attacker.workers.dev/api/session/status/dev_222
+hxxps://also-evil[.]example/login
+https://t.me/+InviteCodeHere
+https://dictanote.co/n/1393926/
+dub.sh/6SaEhaD
+```
+
+#### 3. Run the trimmer
+
+```bash
+python3 ioc_txt_trimmer.py
+```
+
+It **rewrites `ioc.txt` in place** (the messy file becomes the clean file).  
+It also prints each kept IOC on screen.
+
+#### What you get back (same file, cleaned)
+
+```text
+0d46907320ab55d98966389f41441aa0341a7db829cd166748d8929d466c9fba
+192.64.119.211
+smartviewdevices.com
+evil-cdn.bad-example.com
+zokrie.click
+abc123.attacker.workers.dev
+also-evil.example
+https://t.me/+invitecodehere
+https://dictanote.co/n/1393926
+dub.sh/6saehad
+```
+
+Notice:
+
+- Two long `workers.dev` **URLs** became **one hostname** (same host, different paths).
+- `hxxps://also-evil[.]example/login` was un-defanged, then reduced to `also-evil.example`.
+- `t.me`, `dictanote.co`, and `dub.sh` stayed as **URLs** so you do not block all of Telegram / that SaaS / that shortener.
+
+#### Line-by-line: what happens to each kind of IOC
+
+| You paste | Tool writes | Why |
+|-----------|-------------|-----|
+| `0d4690…c9fba  malware sample` | `0d4690…c9fba` | Hash kept; note after it is dropped |
+| `192.64.119.211` | `192.64.119.211` | IP unchanged |
+| `smartviewdevices.com` | `smartviewdevices.com` | Already a hostname |
+| `https://evil-cdn.bad-example.com/payload.exe?id=123` | `evil-cdn.bad-example.com` | Attacker URL → **full hostname only** (not the whole `bad-example.com` company) |
+| `http://zokrie.click:4536/gate` | `zokrie.click` | Path and port dropped; firewall wants the host |
+| Two `….workers.dev/api/session/…` URLs | **one** `….workers.dev` host | Same host, unique paths — those paths would explode a blocklist |
+| `hxxps://also-evil[.]example/login` | `also-evil.example` | Defanged URL is repaired (`hxxps`/`[.]`), then collapsed |
+| `https://t.me/+InviteCodeHere` | **URL kept** | `t.me` is on the shared-host list — blocking the host would block Telegram |
+| `https://dictanote.co/n/1393926/` | **URL kept** | Shared/legit product; the **path** is the IOC |
+| `dub.sh/6SaEhaD` | **URL kept** | Shortener — you want this exact link, not all of `dub.sh` |
+
+**Rule of thumb**
+
+- Dedicated malware host → keep the **hostname** (FQDN or IP).
+- Shared / household-name site (Google, Telegram, shorteners, many SaaS apps) → keep the **full URL**.
+- The tool never “climbs up” to a parent like `workers.dev` or `com`. It only uses the host that was actually in the URL.
+
+#### What you will see in the terminal (besides the clean list)
+
+Lines like this mean a URL was **left as a URL on purpose**:
+
+```text
+kept URL (shared host t.me): https://t.me/+invitecodehere
+kept URL (shared host dictanote.co): https://dictanote.co/n/1393926
+kept URL (shared host dub.sh): dub.sh/6saehad
+
+Wrote 10 unique IOC(s) to ioc.txt  (collapsed URLs→host: 5, kept shared URLs: 3, other: 3)
+```
+
+Read those “kept URL” lines before you push the list to the proxy. If a host should have been collapsed (or should have been kept), add or remove it from the shared-host list (below).
+
+#### Shared hosts (“don’t turn this URL into just the domain”)
+
+Shipped file: **`shared_hosts.txt`** (shorteners, big tech, chat apps, common file hosts, plus some abused SaaS).  
+This is a **starter list we maintain here**, not an official internet feed. Edit it, or add **your** exceptions without touching the shipped file:
+
+```text
+# shared_hosts.local.txt  (create this; it is gitignored)
+your-company-saas.example
+```
+
+One hostname per line. If the URL’s host **is** that name or a **subdomain** of it, the URL is kept.
+
+#### Optional switches (you can ignore these)
+
+```bash
+python3 ioc_txt_trimmer.py path/to/other_iocs.txt   # different file
+python3 ioc_txt_trimmer.py --keep-urls              # never collapse URLs (safest, noisiest)
+python3 ioc_txt_trimmer.py --hosts-only             # always collapse URLs (ignore the shared list)
+python3 ioc_txt_trimmer.py --shared-hosts extra.txt # merge another host list
+```
+
+Default (no switches) is the hybrid mode shown in the examples — that is what you want day to day.
 
 ### VirusTotal hash → SHA-256
 
@@ -123,6 +231,8 @@ sec_tools/
 ├── email_header_spoofing_analyzer.py
 ├── ioc_txt_trimmer.py
 ├── get_sha256.py
+├── shared_hosts.txt        # don't-collapse these hosts from URL → FQDN
+├── shared_hosts.local.txt  # optional extra hosts (gitignored)
 ├── header.txt.example      # template
 ├── ioc.txt.example         # template
 ├── sha1_list.txt.example   # template

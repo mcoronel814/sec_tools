@@ -1,0 +1,146 @@
+# Hosts / parent domains that must NOT be collapsed from URL → FQDN.
+#
+# If a URL's hostname is exactly one of these, or a subdomain of one of these,
+# ioc_txt_trimmer.py keeps the full URL (so you don't block all of Telegram,
+# Google, a shortener, etc.).
+#
+# This is a LOCAL curated list — there is no single official "don't block
+# these hosts" feed for this job. It is based on:
+#   - Common SOC practice (overblock collateral)
+#   - Overlap with public lists you can extend from if you want:
+#       MISP warning lists: https://github.com/MISP/misp-warninglists
+#         (url-shortener, microsoft, google, ...)
+#       Shortener inventories (various GitHub lists)
+#       Tranco top sites (popular ≠ "never collapse", but a hint)
+#
+# Do NOT put public suffixes / multi-tenant *parents* here
+# (workers.dev, github.io, netlify.app, b-cdn.net, azurewebsites.net).
+# Those should collapse to the FULL tenant hostname, not stay as long URLs.
+#
+# Add one host per line. Lines starting with # are comments.
+# To customize without editing this file, use --shared-hosts PATH
+# or create shared_hosts.local.txt (merged on top; gitignored).
+
+# --- Messaging / social ---
+t.me
+telegram.me
+telegram.org
+whatsapp.com
+wa.me
+facebook.com
+fb.com
+fb.me
+instagram.com
+twitter.com
+x.com
+t.co
+linkedin.com
+lnkd.in
+reddit.com
+tiktok.com
+discord.com
+discord.gg
+signal.org
+slack.com
+webex.com
+teams.microsoft.com
+
+# --- URL shorteners (block the destination, not the shortener) ---
+bit.ly
+bitly.com
+tinyurl.com
+tiny.cc
+is.gd
+cutt.ly
+rebrand.ly
+shorturl.at
+rb.gy
+dub.sh
+tny.im
+soo.gd
+s.id
+v.gd
+buff.ly
+goo.gl
+ow.ly
+trib.al
+tiny.one
+short.io
+
+# --- Big tech / productivity (path is the IOC, host is the product) ---
+google.com
+googleusercontent.com
+googleapis.com
+gstatic.com
+gmail.com
+youtube.com
+youtu.be
+docs.google.com
+drive.google.com
+sites.google.com
+script.google.com
+storage.googleapis.com
+microsoft.com
+microsoftonline.com
+microsoft365.com
+office.com
+office365.com
+live.com
+outlook.com
+sharepoint.com
+onedrive.com
+1drv.ms
+apple.com
+icloud.com
+icloud-content.com
+amazon.com
+amazonaws.com
+cloudfront.net
+dropbox.com
+dropboxusercontent.com
+box.com
+notion.so
+notion.site
+atlassian.net
+jira.com
+confluence.com
+trello.com
+salesforce.com
+force.com
+servicenow.com
+okta.com
+adobe.com
+zoom.us
+
+# --- Code / file hosting (account or path specific) ---
+github.com
+githubusercontent.com
+gist.github.com
+gitlab.com
+bitbucket.org
+sourceforge.net
+
+# --- File transfer / paste / notes often abused via PATH ---
+pastebin.com
+paste.ee
+mediafire.com
+mega.nz
+mega.co.nz
+wetransfer.com
+we.tl
+sendspace.com
+docsend.com
+
+# --- Seen in local campaigns as abused SaaS (keep URL, not whole product) ---
+storyflow.so
+dictanote.co
+plaud.ai
+larksuite.com
+
+# --- Other high-collateral webmail / portals ---
+yahoo.com
+aol.com
+proton.me
+protonmail.com
+zoho.com
+outlook.office.com
