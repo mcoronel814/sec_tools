@@ -289,6 +289,99 @@ Received: from send.example ([203.0.113.10]) by mx.example
         self.assertIn("books@notification.vendor.example", text)
         self.assertNotIn("secureserver.net —", text)
         self.assertNotIn("Often an ESP", "\n".join(msg for _, _, msg in severities(result)))
+        self.assertTrue(any("Outbound spam from the forwarding tenant" in msg for _, _, msg in severities(result, "gateway")))
+        self.assertTrue(any("not the From domain" in msg for _, _, msg in severities(result, "spf")))
+        self.assertIn("Block the forwarders below", text)
+
+    def test_payment_lure_subject_stays_low(self):
+        result, action = run(
+            """From: Vendor <v@vendor.example>
+To: analyst@corp.example
+Subject: Your balance is settled
+Authentication-Results: mx.example; spf=pass smtp.mailfrom=vendor.example;
+ dkim=pass header.d=vendor.example; dmarc=pass header.from=vendor.example
+Received: from mail.vendor.example ([203.0.113.40]) by mx.example
+"""
+        )
+        self.assertEqual(action["action"], "MONITOR")
+        self.assertTrue(
+            any(sev == "LOW" and "payment or invoice" in msg for sev, _, msg in severities(result, "content"))
+        )
+
+    def test_acceptlist_without_a_spam_verdict_stays_monitor(self):
+        result, action = run(
+            """From: Vendor <v@vendor.example>
+To: analyst@corp.example
+Subject: Weekly update
+X-IronPort-SenderGroup: ACCEPTLIST
+X-IronPort-MailFlowPolicy: $ACCEPTED
+X-IronPort-Reputation: 2.9
+X-IronPort-RemoteIP: 203.0.113.50
+Authentication-Results: mx.example; spf=pass smtp.mailfrom=vendor.example;
+ dkim=pass header.d=vendor.example; dmarc=pass header.from=vendor.example
+Received: from mail.vendor.example ([203.0.113.50]) by mx.example
+"""
+        )
+        self.assertEqual(action["action"], "MONITOR")
+        self.assertFalse(any("delivered this on" in msg for _, _, msg in severities(result)))
+
+    def test_forwarded_brand_message_names_the_relay(self):
+        org = OrgWatch(domains={"corp.example"})
+        result, action = run(
+            """From: Books <books@notification.vendor.example>
+Return-Path: <bounces+SRS=E7nYK=JI@forwarder.example>
+To: info-006@outside.example
+X-CM-Forward: info-006@outside.example
+X-SECURESERVER-ACCT: info-006@outside.example
+X-MS-Exchange-CrossTenant-Id: ded39701-1e9a-4591-9b85-8b75947f552a
+X-MS-Exchange-Processed-By-BccFoldering: 15.02.2562.056
+X-IronPort-SenderGroup: ACCEPTLIST
+X-IronPort-Reputation: 2.9
+X-IronPort-MailFlowPolicy: $ACCEPTED
+X-IronPort-RemoteIP: 52.102.194.42
+X-Amp-Result: LOWRISK
+X-Amp-File-Uploaded: False
+X-IronPort-AV: E=Sophos;i="6.27,220,1787025600"; d="pdf'?scan'208";a="1"
+X-Forefront-Antispam-Report: CIP:203.0.113.51;SCL:5;SFV:SPM;CAT:OSPM;DIR:OUT;
+X-MS-Exchange-Organization-SCL: 0
+Authentication-Results: mx.example; spf=pass smtp.mailfrom=bounces+SRS=E7nYK=JI@forwarder.example;
+ dkim=pass header.d=notification.vendor.example; dkim=pass header.d=tenant.onmicrosoft.com;
+ dmarc=pass (p=reject dis=none) header.from=notification.vendor.example
+ARC-Authentication-Results: i=1; mx.microsoft.com 1; spf=pass (sender ip is
+ 173.201.192.51) smtp.rcpttodomain=forwarder.example smtp.mailfrom=bounce.secureserver.net
+DKIM-Signature: v=1; d=notification.vendor.example; s=s1
+DKIM-Signature: v=1; d=tenant.onmicrosoft.com; s=selector1
+Subject: Thank You – Your Balance Is Settled
+Received: from mail-japanwest.outbound.protection.outlook.com ([52.102.194.42]) by mx.example
+Received: from SG1PEPF.outlook.com (2603:1096:4:191::22) by SI2.outlook.office365.com (2603:1096:4:191::23)
+Received: from osplwbeout.prod.phx3.secureserver.net (173.201.192.51) by SG1PEPF.mail.protection.outlook.com (10.167.240.8)
+Received: from wrqvpvcv.outbound-mail.sendgrid.net ([149.72.56.200]) by CMGW
+Received: from MzUxMjAwNDM (unknown) by geopod-ismtpd-61 (SG) with HTTP id abc for <info-006@outside.example>
+""",
+            org,
+        )
+        self.assertEqual(action["action"], "QUARANTINE")
+        text = "\n".join(action["lines"])
+        self.assertIn("Block the forwarders below", text)
+        self.assertIn("Tenant id ded39701-1e9a-4591-9b85-8b75947f552a", text)
+        self.assertIn("info-006@outside.example", text)
+        self.assertIn("35120043", text)
+        self.assertIn("149.72.56.200", text)
+        self.assertIn("52.102.194.42", text)
+        self.assertNotIn("173.201.192.51 —", text)
+        self.assertNotIn("secureserver.net —", text)
+        self.assertIn("books@notification.vendor.example", text)
+        messages = "\n".join(msg for _, _, msg in severities(result))
+        self.assertIn("Outbound spam from the forwarding tenant", messages)
+        self.assertIn("not the From domain", messages)
+        self.assertIn("was not sandboxed", messages)
+        self.assertIn("delivered this on", messages)
+        self.assertIn("X-CM-Forward names info-006@outside.example", messages)
+        self.assertIn("for forwarder.example", messages)
+        self.assertIn("173.201.192.51", messages)
+        ips = [item["ip"] for hop in result.hops for item in hop["ips"]]
+        self.assertIn("2603:1096:4:191::22", ips)
+        self.assertEqual(result.sendgrid_customer_id, "35120043")
 
 
 if __name__ == "__main__":

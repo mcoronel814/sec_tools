@@ -16,6 +16,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import base64
 import ipaddress
 import json
 import re
@@ -103,6 +104,13 @@ class AnalysisResult:
     attachment_types: list[str] = field(default_factory=list)
     signature_domains: list[str] = field(default_factory=list)
     our_domains: set[str] = field(default_factory=set)
+    tenant_id: str = ""
+    forward_account: str = ""
+    forward_source: str = ""
+    forward_account_domain: str = ""
+    sendgrid_customer_id: str = ""
+    prior_receipts: list[dict[str, str]] = field(default_factory=list)
+    shared_relays: list[dict[str, str]] = field(default_factory=list)
 
     def add(self, severity: str, category: str, message: str) -> None:
         self.findings.append(Finding(severity, category, message))
@@ -219,6 +227,8 @@ _IP_PATTERNS = [
         r"(?:\d{1,3}\.){3}\d{1,3}"
         r")\)"
     ),
+    # Microsoft Received lines put IPv6 in parentheses, not brackets.
+    re.compile(r"\(([0-9a-fA-F]{0,4}:[0-9a-fA-F:]*)\)"),
 ]
 
 
@@ -515,6 +525,7 @@ def collect_gateway_signals(headers) -> dict[str, Any]:
         "forefront_antispam": "X-Forefront-Antispam-Report",
         "tm_as_result": "X-TM-AS-Result",
         "amp_result": "X-Amp-Result",
+        "amp_file_uploaded": "X-Amp-File-Uploaded",
         "ironport_av": "X-IronPort-AV",
     }
     for key, hdr in mapping.items():
@@ -632,8 +643,8 @@ def _claims_our_domain(domain: str, watch: OrgWatch) -> bool:
 
 
 def parse_forefront(value: str) -> dict[str, Any]:
-    """Split an X-Forefront-Antispam-Report into SCL, SFV, and CAT values."""
-    parsed: dict[str, Any] = {"scl": "", "sfv": "", "cats": []}
+    """Split an X-Forefront-Antispam-Report into SCL, SFV, CAT, and DIR values."""
+    parsed: dict[str, Any] = {"scl": "", "sfv": "", "cats": [], "dir": ""}
     for part in value.split(";"):
         if ":" not in part:
             continue
@@ -648,7 +659,147 @@ def parse_forefront(value: str) -> dict[str, Any]:
             parsed["sfv"] = val.upper()
         elif key == "SCL" and not parsed["scl"]:
             parsed["scl"] = val
+        elif key == "DIR" and not parsed["dir"]:
+            parsed["dir"] = val.upper()
     return parsed
+
+
+def sendgrid_customer_id(token: str) -> str:
+    """Numeric SendGrid customer id hidden in an HTTP-injection HELO token."""
+    if not re.fullmatch(r"[A-Za-z0-9+/]{6,32}", token):
+        return ""
+    padded = token + "=" * ((-len(token)) % 4)
+    try:
+        text = base64.b64decode(padded, validate=True).decode("ascii")
+    except (ValueError, UnicodeDecodeError):
+        return ""
+    return text if text.isdigit() else ""
+
+
+def _guid(value: str) -> str:
+    match = re.search(
+        r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}",
+        value,
+    )
+    return match.group(0).lower() if match else ""
+
+
+def extract_tenant_id(headers) -> str:
+    """Microsoft 365 tenant GUID. The onmicrosoft name can change; this does not."""
+    for name in ("X-MS-Exchange-CrossTenant-Id", "X-EOPTenantAttributedMessage"):
+        val = headers.get(name)
+        if not val:
+            continue
+        found = _guid(" ".join(str(val).split()))
+        if found:
+            return found
+    return ""
+
+
+def extract_forward_account(headers) -> tuple[str, str, str]:
+    """Mailbox a forwarder named, plus the header that named it."""
+    for name in ("X-CM-Forward", "X-SECURESERVER-ACCT"):
+        val = headers.get(name)
+        if not val:
+            continue
+        _, addr, domain = extract_address(str(val))
+        if addr:
+            return addr, domain, name
+    return "", "", ""
+
+
+def parse_prior_receipts(headers) -> list[dict[str, str]]:
+    """Envelope facts from an earlier hop.
+
+    ARC and Authentication-Results-Original are not this gateway's verdict,
+    so they stay out of the scored SPF/DKIM/DMARC lists.
+    """
+    receipts: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for name in ("ARC-Authentication-Results", "Authentication-Results-Original"):
+        for val in headers.get_all(name) or []:
+            text = " ".join(str(val).split())
+            mf = re.search(r"smtp\.mailfrom=<?([^\s;>]+)>?", text, re.I)
+            rc = re.search(r"smtp\.rcpttodomain=<?([^\s;>]+)>?", text, re.I)
+            ipm = re.search(r"sender ip is\s+([0-9a-fA-F:.]+)", text, re.I)
+            if not ipm:
+                ipm = re.search(r"client-ip=([0-9a-fA-F:.]+)", text, re.I)
+            mailfrom = mf.group(1).strip().lower() if mf else ""
+            rcpt = rc.group(1).strip().lower().rstrip(".") if rc else ""
+            client_ip = ipm.group(1).rstrip(".;") if ipm else ""
+            key = (mailfrom, rcpt, client_ip)
+            if not any(key) or key in seen:
+                continue
+            seen.add(key)
+            receipts.append({
+                "source": name,
+                "mailfrom": mailfrom,
+                "rcpt_domain": rcpt,
+                "client_ip": client_ip,
+            })
+    return receipts
+
+
+def _mailfrom_domain(mailfrom: str) -> str:
+    mailfrom = (mailfrom or "").strip().lower().rstrip(".")
+    if "@" in mailfrom:
+        return mailfrom.rsplit("@", 1)[-1]
+    return mailfrom if "." in mailfrom else ""
+
+
+def _shared_relay_note(hop: str, ip: str) -> str:
+    """Shared platform address on the sending side of a hop.
+
+    The receiving host is often a different company. Only the from-side
+    hostname is allowed to explain the IP.
+    """
+    from_side = re.split(r"\s+by\s+", hop, maxsplit=1, flags=re.I)[0]
+    if ip not in from_side:
+        return ""
+    low = from_side.lower()
+    if "sendgrid.net" in low:
+        return "shared SendGrid address. Report the customer id, not this IP."
+    if "protection.outlook.com" in low:
+        return "shared Microsoft 365 outbound address. Block the forwarding tenant, not this IP."
+    return ""
+
+
+def _filter_called_spam(subject: str, gateway: dict[str, Any]) -> bool:
+    """True when a filter other than the allowlist already called the message spam."""
+    if SUBJECT_RISK_TAG.search(subject or ""):
+        return True
+    ff_raw = gateway.get("forefront_antispam") or ""
+    if ff_raw:
+        ff = parse_forefront(str(ff_raw))
+        if ff["sfv"] in _FOREFRONT_RISK_SFV:
+            return True
+        if any(
+            cat in _FOREFRONT_HIGH_CATS or cat in _FOREFRONT_MED_CATS or cat == "OSPM"
+            for cat in ff["cats"]
+        ):
+            return True
+        if ff["scl"]:
+            try:
+                if int(str(ff["scl"]).split()[0]) >= 5:
+                    return True
+            except ValueError:
+                pass
+    if gateway.get("ms_scl") is not None:
+        try:
+            if int(str(gateway["ms_scl"]).split()[0]) >= 5:
+                return True
+        except ValueError:
+            pass
+    return False
+
+
+def _authenticated_forward(result: AnalysisResult) -> bool:
+    """DMARC passed for From, and a different domain rewrote the envelope."""
+    if not _dmarc_passed(result) or not result.forwarder_domain:
+        return False
+    if result.from_domain and domains_align(result.forwarder_domain, result.from_domain):
+        return False
+    return True
 
 
 # Higher-signal subject patterns (avoid ultra-generic words like "file"/"review")
@@ -670,6 +821,11 @@ SUBJECT_RISK_TAG = re.compile(
 )
 SUBJECT_BANNER_TAG = re.compile(
     r"\[(?:external(?:\s+email)?|caution)\]",
+    re.I,
+)
+# Weak lure words. LOW only, so an ordinary invoice does not raise the action.
+SUBJECT_PAYMENT = re.compile(
+    r"\b(balance|invoice|settled|payment|voicemail)\b",
     re.I,
 )
 
@@ -702,6 +858,9 @@ def analyze(headers, raw_header: str, org: OrgWatch | None = None) -> AnalysisRe
     r.our_domains = set(org.domains)
     r.forwarder_domain = srs_forwarder_domain(r.return_path)
     r.received_as_bcc = bool(headers.get("X-MS-Exchange-Processed-By-BccFoldering"))
+    r.tenant_id = extract_tenant_id(headers)
+    r.forward_account, r.forward_account_domain, r.forward_source = extract_forward_account(headers)
+    r.prior_receipts = parse_prior_receipts(headers)
     r.message_id = " ".join(str(headers.get("Message-ID") or headers.get("Message-Id") or "").split())
     r.date = " ".join(str(headers.get("Date") or "").split())
 
@@ -787,13 +946,28 @@ def analyze(headers, raw_header: str, org: OrgWatch | None = None) -> AnalysisRe
     elif r.from_domain and not r.return_domain:
         r.add("LOW", "identity", "Return-Path missing or unparseable")
 
-    if r.received_as_bcc and r.to_addr:
-        watched = OrgWatch(domains=set(r.our_domains))
-        outside = bool(r.our_domains) and not (
-            r.to_domain and _claims_our_domain(r.to_domain, watched)
-        )
+    watched = OrgWatch(domains=set(r.our_domains))
+    to_outside = bool(r.our_domains) and bool(r.to_domain) and not _claims_our_domain(r.to_domain, watched)
+    forward_outside = (
+        bool(r.our_domains)
+        and bool(r.forward_account_domain)
+        and not _claims_our_domain(r.forward_account_domain, watched)
+    )
+    if r.forward_account:
+        if r.to_addr and r.to_addr == r.forward_account:
+            delivered = f" Visible To is {r.to_addr}, and the message was delivered onward from that mailbox."
+        elif r.to_addr:
+            delivered = f" Visible To is {r.to_addr}."
+        else:
+            delivered = ""
         r.add(
-            "MEDIUM" if outside else "INFO",
+            "MEDIUM" if forward_outside else "INFO",
+            "path",
+            f"{r.forward_source} names {r.forward_account} as the forwarding mailbox.{delivered}",
+        )
+    elif r.received_as_bcc and r.to_addr:
+        r.add(
+            "MEDIUM" if to_outside else "INFO",
             "path",
             f"A mailbox received this as a blind copy. Visible To is {r.to_addr}.",
         )
@@ -908,6 +1082,29 @@ def analyze(headers, raw_header: str, org: OrgWatch | None = None) -> AnalysisRe
                 r.add("MEDIUM", "spf", "SPF PERMERROR — broken SPF record for the domain")
             else:
                 r.add("LOW", "spf", f"SPF result '{res}' (identity={ident})")
+
+        misaligned_spf: list[str] = []
+        for s in r.spf:
+            if (s.get("result") or "").lower() != "pass":
+                continue
+            if (s.get("identity") or "") == "helo":
+                continue
+            mailed = _mailfrom_domain(s.get("mailfrom") or "")
+            if (
+                mailed
+                and r.from_domain
+                and not domains_align(mailed, r.from_domain)
+                and mailed not in misaligned_spf
+            ):
+                misaligned_spf.append(mailed)
+        if misaligned_spf:
+            r.add(
+                "INFO",
+                "spf",
+                "SPF pass authenticates "
+                + ", ".join(misaligned_spf)
+                + f", not the From domain {r.from_domain}.",
+            )
 
     # ========== DKIM ==========
     if not r.dkim and not dkim_sigs:
@@ -1054,6 +1251,18 @@ def analyze(headers, raw_header: str, org: OrgWatch | None = None) -> AnalysisRe
                 origin_public_ip = ip
             if kind in EXTERNAL_KINDS:
                 public_seen = True
+            if kind == "public":
+                note = _shared_relay_note(hop, ip)
+                if note and not any(item["ip"] == ip for item in r.shared_relays):
+                    r.shared_relays.append({"ip": ip, "note": note})
+        if (
+            not r.sendgrid_customer_id
+            and re.search(r"\bwith\s+HTTP\b", hop, re.I)
+            and re.search(r"sendgrid|geopod|\(SG\)", hop, re.I)
+        ):
+            named = re.search(r"\bfrom\s+([A-Za-z0-9+/]{6,32})\b", hop)
+            if named:
+                r.sendgrid_customer_id = sendgrid_customer_id(named.group(1))
         r.hops.append(hop_info)
 
     if origin_public_ip:
@@ -1085,36 +1294,90 @@ def analyze(headers, raw_header: str, org: OrgWatch | None = None) -> AnalysisRe
                 f"while external hops exist later — verify path integrity / incomplete headers",
             )
 
+    if r.sendgrid_customer_id:
+        for item in r.shared_relays:
+            if "SendGrid" in item["note"]:
+                item["note"] = (
+                    f"shared SendGrid address. Report customer id {r.sendgrid_customer_id}, not this IP."
+                )
+        r.add(
+            "INFO",
+            "path",
+            f"SendGrid HTTP API injection, customer id {r.sendgrid_customer_id}. "
+            "Report that id. Do not block the shared SendGrid IP.",
+        )
+    for prior in r.prior_receipts:
+        parts: list[str] = []
+        if prior["rcpt_domain"]:
+            parts.append(f"for {prior['rcpt_domain']}")
+        if prior["mailfrom"]:
+            parts.append(f"from envelope {prior['mailfrom']}")
+        if prior["client_ip"]:
+            parts.append(f"at {prior['client_ip']}")
+        if parts:
+            r.add(
+                "INFO",
+                "path",
+                f"Earlier hop ({prior['source']}) accepted this " + ", ".join(parts) + ".",
+            )
+
     # ========== Gateway reputation ==========
     g = r.gateway
     sg = g.get("ironport_sender_group") or ""
+    spam_marked = _filter_called_spam(r.subject, g)
+    accepted_group = bool(sg) and _token_has_word(_group_tokens(sg), ("ACCEPTLIST",))
+    policy = g.get("ironport_mailflow_policy") or ""
+    accepted_policy = "ACCEPTED" in policy.upper()
+    allowlist_override = (accepted_group or accepted_policy) and spam_marked
     if sg:
         tokens = _group_tokens(sg)
         if _token_has_word(tokens, _RISK_GROUP_WORDS):
             r.add("HIGH", "gateway", f"IronPort SenderGroup indicates risk: {sg}")
         elif _token_has_word(tokens, _SAFE_GROUP_WORDS):
             r.add("INFO", "gateway", f"IronPort SenderGroup: {sg}")
-        else:
+        elif not (allowlist_override and accepted_group):
             r.add("LOW", "gateway", f"IronPort SenderGroup: {sg}")
 
     if g.get("ironport_reputation"):
         try:
             rep = float(g["ironport_reputation"])
+            remote = g.get("ironport_remote_ip") or ""
+            whose = f" for connecting IP {remote}" if remote else ""
             if rep < -5:
-                r.add("HIGH", "gateway", f"IronPort reputation very poor: {rep}")
+                r.add("HIGH", "gateway", f"IronPort reputation very poor: {rep}{whose}")
             elif rep < 0:
-                r.add("MEDIUM", "gateway", f"IronPort reputation negative: {rep}")
+                r.add("MEDIUM", "gateway", f"IronPort reputation negative: {rep}{whose}")
             else:
-                r.add("INFO", "gateway", f"IronPort reputation: {rep}")
+                r.add("INFO", "gateway", f"IronPort reputation: {rep}{whose}")
         except ValueError:
             r.add("INFO", "gateway", f"IronPort reputation: {g['ironport_reputation']}")
 
-    if g.get("ironport_mailflow_policy"):
-        pol = g["ironport_mailflow_policy"]
-        if any(x in pol.lower() for x in ("quarantine", "reject", "drop", "suspect")):
-            r.add("MEDIUM", "gateway", f"IronPort MailFlow policy: {pol}")
-        else:
-            r.add("INFO", "gateway", f"IronPort MailFlow policy: {pol}")
+    if policy:
+        if any(x in policy.lower() for x in ("quarantine", "reject", "drop", "suspect")):
+            r.add("MEDIUM", "gateway", f"IronPort MailFlow policy: {policy}")
+        elif not (allowlist_override and accepted_policy):
+            r.add("INFO", "gateway", f"IronPort MailFlow policy: {policy}")
+
+    if allowlist_override:
+        how: list[str] = []
+        if accepted_group:
+            how.append(f"sender group {sg}")
+        if accepted_policy:
+            how.append(f"policy {policy}")
+        msg = (
+            "IronPort delivered this on "
+            + " and ".join(how)
+            + " after another filter marked it spam."
+        )
+        remote = g.get("ironport_remote_ip") or ""
+        if g.get("ironport_reputation") and remote:
+            msg += (
+                f" Reputation {g['ironport_reputation']} belongs to connecting IP {remote},"
+                " not the From domain."
+            )
+        elif remote:
+            msg += f" The connecting IP was {remote}."
+        r.add("MEDIUM", "gateway", msg)
 
     if g.get("ms_scl") is not None:
         try:
@@ -1155,6 +1418,12 @@ def analyze(headers, raw_header: str, org: OrgWatch | None = None) -> AnalysisRe
         elif med_cats:
             bits.append("CAT=" + ",".join(med_cats))
             sev_rank = max(sev_rank, 2)
+        outbound_note = ""
+        if "OSPM" in ff["cats"]:
+            bits.append("CAT=OSPM")
+            sev_rank = 3
+            if ff.get("dir") == "OUT":
+                outbound_note = " Outbound spam from the forwarding tenant."
         sfv = ff["sfv"]
         if sfv in _FOREFRONT_RISK_SFV:
             bits.append(f"SFV={sfv}")
@@ -1186,9 +1455,17 @@ def analyze(headers, raw_header: str, org: OrgWatch | None = None) -> AnalysisRe
             )
         if bits and sev_rank >= 2:
             severity = "HIGH" if sev_rank >= 3 else "MEDIUM"
-            r.add(severity, "gateway", "Forefront antispam: " + " ".join(bits) + "." + disagreement)
+            r.add(
+                severity,
+                "gateway",
+                "Forefront antispam: " + " ".join(bits) + "." + outbound_note + disagreement,
+            )
         elif bits:
-            r.add("LOW", "gateway", "Forefront antispam: " + " ".join(bits) + "." + disagreement)
+            r.add(
+                "LOW",
+                "gateway",
+                "Forefront antispam: " + " ".join(bits) + "." + outbound_note + disagreement,
+            )
 
     if r.attachment_types:
         r.add(
@@ -1196,6 +1473,23 @@ def analyze(headers, raw_header: str, org: OrgWatch | None = None) -> AnalysisRe
             "content",
             "IronPort scanned attachment type(s): " + ", ".join(r.attachment_types),
         )
+
+    amp = (g.get("amp_result") or "").strip()
+    uploaded = (g.get("amp_file_uploaded") or "").strip().lower()
+    if amp:
+        if amp.upper() == "LOWRISK" and uploaded == "false":
+            r.add(
+                "MEDIUM",
+                "content",
+                "AMP result is LOWRISK and the file was not uploaded. The attachment was not sandboxed.",
+            )
+        elif amp.upper() in {"MALICIOUS", "HIGH"}:
+            r.add("HIGH", "content", f"AMP result: {amp}")
+        else:
+            filed = ""
+            if g.get("amp_file_uploaded"):
+                filed = f", file uploaded={g['amp_file_uploaded']}"
+            r.add("INFO", "content", f"AMP result: {amp}{filed}")
 
     if g.get("threat_scanner"):
         tv = g["threat_scanner"]
@@ -1267,6 +1561,12 @@ def analyze(headers, raw_header: str, org: OrgWatch | None = None) -> AnalysisRe
             "LOW",
             "content",
             "Subject matches urgency/credential-theft language patterns (weak signal — verify body)",
+        )
+    if SUBJECT_PAYMENT.search(r.subject):
+        r.add(
+            "LOW",
+            "content",
+            "Subject matches payment or invoice lure language (weak signal — verify body)",
         )
 
     to_lower = r.to_addrs.lower()
@@ -1374,7 +1674,24 @@ def _path_notes(r: AnalysisResult) -> list[str]:
             + ". Those names are not block targets."
         )
 
-    if r.received_as_bcc and r.to_addr:
+    if r.sendgrid_customer_id:
+        notes.append(
+            f"SendGrid HTTP API customer id {r.sendgrid_customer_id}. "
+            "Report that id. The SendGrid IP is shared."
+        )
+    for prior in r.prior_receipts:
+        parts: list[str] = []
+        if prior["rcpt_domain"]:
+            parts.append(f"for {prior['rcpt_domain']}")
+        if prior["mailfrom"]:
+            parts.append(f"envelope {prior['mailfrom']}")
+        if prior["client_ip"]:
+            parts.append(f"client {prior['client_ip']}")
+        if parts:
+            notes.append(f"Earlier hop ({prior['source']}): " + ", ".join(parts) + ".")
+    if r.forward_account:
+        notes.append(f"{r.forward_source} names forwarding mailbox {r.forward_account}.")
+    elif r.received_as_bcc and r.to_addr:
         notes.append(f"Received as a blind copy. Visible To is {r.to_addr}.")
     if r.attachment_types:
         notes.append(
@@ -1414,9 +1731,24 @@ def _block_advice(r: AnalysisResult) -> tuple[list[str], list[str], list[str]]:
         )
 
     if (
+        r.forward_account
+        and r.forward_account_domain
+        and r.our_domains
+        and not ours(r.forward_account_domain)
+    ):
+        add(
+            block,
+            r.forward_account,
+            "Forwarding mailbox named in the headers. The message was delivered to someone else.",
+        )
+        if not _under_huge_mail_parent(r.forward_account_domain):
+            add(block, r.forward_account_domain, "Domain of that forwarding mailbox.")
+
+    if (
         r.received_as_bcc
         and r.to_addr
         and r.to_domain
+        and r.to_addr != r.forward_account
         and r.our_domains
         and not ours(r.to_domain)
     ):
@@ -1436,12 +1768,13 @@ def _block_advice(r: AnalysisResult) -> tuple[list[str], list[str], list[str]]:
             continue
         if ours(domain) or _under_huge_mail_parent(domain):
             continue
-        add(
-            block,
-            domain,
+        reason = (
             "DKIM passed for this name, which is not the From domain. "
-            "Block this name only, not its parent.",
+            "Block this name only, not its parent."
         )
+        if r.tenant_id and domain.endswith(".onmicrosoft.com"):
+            reason += f" Tenant id {r.tenant_id}."
+        add(block, domain, reason)
 
     if (
         r.reply_to
@@ -1468,6 +1801,8 @@ def _block_advice(r: AnalysisResult) -> tuple[list[str], list[str], list[str]]:
 
     if _dmarc_passed(r) and r.from_addr:
         add(spare, r.from_addr, f"DMARC passed for {r.from_domain or 'the From domain'}.")
+    for relay in r.shared_relays:
+        add(spare, relay["ip"], relay["note"])
     return block, confirm, spare
 
 
@@ -1533,13 +1868,26 @@ def recommended_action(r: AnalysisResult) -> dict[str, Any]:
 
     if high:
         level = "QUARANTINE"
-        lines = [
-            "RECOMMENDED ACTION: QUARANTINE / hold — treat as malicious until proven safe.",
-            "No classic domain-spoof auth failures, but HIGH risk signals are present",
-            "(gateway reputation, spam confidence, threat verdict, etc.).",
-            "Do not clear to the inbox based on headers alone.",
-            "Next: inspect body/links/attachments; confirm whether the user expected this sender.",
-        ]
+        forwarded_brand = _authenticated_forward(r) and any(
+            f.category == "gateway" and f.severity == "HIGH" and "Forefront" in f.message
+            for f in high
+        )
+        if forwarded_brand:
+            lines = [
+                "RECOMMENDED ACTION: QUARANTINE / hold — treat as malicious until proven safe.",
+                f"From domain {r.from_domain or 'the sender'} authenticated (DMARC passed). "
+                f"{r.forwarder_domain} forwarded the message. That domain is not the From domain.",
+                "Block the forwarders below. Leave the authenticated From address in place.",
+                "Do not clear to the inbox based on headers alone.",
+            ]
+        else:
+            lines = [
+                "RECOMMENDED ACTION: QUARANTINE / hold — treat as malicious until proven safe.",
+                "No classic domain-spoof auth failures, but HIGH risk signals are present",
+                "(gateway reputation, spam confidence, threat verdict, etc.).",
+                "Do not clear to the inbox based on headers alone.",
+                "Next: inspect body/links/attachments; confirm whether the user expected this sender.",
+            ]
         for f in high:
             lines.append(f"  - [{f.category}] {f.message}")
         lines.extend(_advice_lines(r))
@@ -1700,6 +2048,11 @@ def result_to_json(r: AnalysisResult) -> str:
         "hops": r.hops,
         "gateway": r.gateway,
         "authentication_results": r.auth_results_raw,
+        "tenant_id": r.tenant_id,
+        "forward_account": r.forward_account,
+        "sendgrid_customer_id": r.sendgrid_customer_id,
+        "prior_receipts": r.prior_receipts,
+        "shared_relays": r.shared_relays,
     }
     return json.dumps(payload, indent=2)
 

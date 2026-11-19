@@ -98,9 +98,9 @@ Get a key from: [VirusTotal → API key](https://www.virustotal.com/gui/my-apike
 
 ## Email header analyzer
 
-**Who this is for:** a user reported a suspicious email. You copied the **headers** (not the whole inbox). You want a fast local read: did SPF/DKIM/DMARC pass? Does Reply-To look like a trap? Did IronPort already hate this sender? Should you treat it as spoofing?
+**Who this is for:** a user reported a suspicious email. You copied the **headers** (not the whole inbox). You want a fast local read: did SPF/DKIM/DMARC pass? Does Reply-To look like a trap? Did a filter already mark it spam? If a brand authenticated, did someone else forward it in?
 
-No live DNS. The tool only reads what is **already in the headers** (including `Authentication-Results` from your gateway).
+No live DNS. The tool only reads what is **already in the headers** (including `Authentication-Results` from your gateway). An earlier hop's ARC result is reported separately and is not treated as your gateway's verdict.
 
 ### 1. Create your working file (once)
 
@@ -132,8 +132,8 @@ A text report with five parts:
 | Section | What it is in plain language |
 |---------|------------------------------|
 | Top identity block | Subject, From, Return-Path, Reply-To, To, Date |
-| **AUTHENTICATION** | What *your mail gateway already decided* for SPF, DKIM, DMARC |
-| **RECEIVED PATH** | The hop list, oldest → newest, with public vs internal IPs |
+| **AUTHENTICATION** | What *your mail gateway already decided* for SPF, DKIM, DMARC. An SPF pass for a different domain than From is labeled as that other domain |
+| **RECEIVED PATH** | The hop list, oldest → newest, with public vs internal IPs, including IPv6 written in parentheses |
 | **GATEWAY / MTA SIGNALS** | IronPort group/reputation, Exchange SCL, threat scanner, etc. (if present) |
 | **FINDINGS** + **ANALYST TAKEAWAY** | Severity-tagged bullets and a recommended **action level** |
 
@@ -142,7 +142,7 @@ A text report with five parts:
 | Action | Meaning | Typical cause |
 |--------|---------|----------------|
 | **BLOCK** | Quarantine / delete; do not click or reply | Clear spoof signals: SPF/DKIM/DMARC **fail**, display-name spoof, Reply-To on another domain when From itself did not pass DMARC, or mail that claims one of your domains and fails auth |
-| **QUARANTINE** | Hold it; treat as bad until proven safe | No classic spoof, but HIGH gateway risk (e.g. IronPort `SUSPECTLIST`) |
+| **QUARANTINE** | Hold it; treat as bad until proven safe | No classic spoof, but HIGH gateway risk (e.g. IronPort `SUSPECTLIST`, or a brand that passed DMARC and was forwarded by someone else) |
 | **INVESTIGATE** | Do not clear on headers alone | Medium signals only — check body, user context, brand impersonation |
 | **MONITOR** | Headers look relatively clean | Still ask: did the user expect this sender? Any links/attachments? |
 
@@ -172,20 +172,40 @@ Do not click links, open attachments, or reply.
 
 A different real-world shape: **SPF/DKIM/DMARC all PASS**, but IronPort tagged `SUSPECTLIST` and the subject says `[SUSPECTED SPAM]`. That is usually **QUARANTINE** or **INVESTIGATE**, not “headers say spoof.” The tool will say that explicitly.
 
+Another shape is a brand that really authenticated, then arrived through someone else's forwarder. SPF passes for the forwarder, DMARC passes for the From domain, and the Return-Path shows `SRS=`. The action stays **QUARANTINE**. The takeaway tells you to block the forwarders and to leave the authenticated From address in place:
+
+```text
+Action level: QUARANTINE
+From domain notification.vendor.example authenticated (DMARC passed).
+forwarder.example forwarded the message. That domain is not the From domain.
+Block the forwarders below. Leave the authenticated From address in place.
+Addresses and domains to block:
+  • forwarder.example
+  • info-006@outside.example
+Do not block:
+  • books@notification.vendor.example
+```
+
 ### Findings you will see often
 
 | Finding | Plain meaning |
 |---------|----------------|
-| SPF / DKIM / DMARC **PASS** | Gateway accepted the sending domain as aligned |
+| SPF / DKIM / DMARC **PASS** | Gateway accepted the sending domain as aligned. An SPF pass for a different domain than From is called out as that other domain |
 | SPF / DKIM / DMARC **FAIL** | Sending IP or signature does not match the claimed domain — strong spoof/break signal |
 | Display-name spoofing | The friendly name looks like a trusted address; the real From is someone else |
 | Reply-To domain does not align | Replies may go to an attacker mailbox. If From passed DMARC, this stays a medium “check it” finding |
 | From / Return-Path differ, DMARC passed | Usual for a mailing service. Not a block |
 | `SRS=` on the Return-Path | A forwarder rewrote the envelope. The takeaway names that domain as the block, and tells you not to block a From that passed DMARC |
-| Blind copy, visible To is someone else | When your domains are in `org_watch.txt`, that outside address is listed to block |
+| Blind copy, or `X-CM-Forward` / `X-SECURESERVER-ACCT` | The visible mailbox forwarded the message. When your domains are in `org_watch.txt`, that outside address is listed to block |
+| SendGrid `with HTTP` | The customer id is decoded from the HELO token. Report that id. The SendGrid and Microsoft 365 outbound IPs are listed under "Do not block" |
+| Earlier hop in ARC or `Authentication-Results-Original` | Who accepted the message before your gateway, and the envelope they saw. Not counted as your gateway's SPF/DKIM/DMARC |
+| DKIM pass for a `something.onmicrosoft.com` name | Block that tenant name only, not all of `onmicrosoft.com`. The tenant id is printed when the header has one |
+| Subject words such as balance, invoice, payment, or voicemail | Weak lure language. Stays LOW and does not raise the action by itself |
 | Watched display name, or a lookalike of your domain | Only if you created `org_watch.txt`. A helpdesk name, or a near-copy of your domain, on someone else’s mail |
 | IronPort SenderGroup / negative reputation | Your *existing* email filter already distrusts this source. `NONSPAM` is not read as spam |
-| Forefront `CAT:PHSH`, `SFV:SPM`, or `SCL:` | Exchange already marked phish or spam. Counted even when the separate SCL header is absent |
+| Forefront `CAT:PHSH`, `SFV:SPM`, `CAT:OSPM`, or `SCL:` | Exchange already marked phish or spam. Counted even when the separate SCL header is absent. `CAT:OSPM` with `DIR:OUT` means the forwarding tenant sent it |
+| IronPort `ACCEPTLIST` or `$ACCEPTED` plus a spam verdict | The allowlist delivered a message another filter already marked spam. Reputation belongs to the connecting IP |
+| AMP `LOWRISK` and file not uploaded | The attachment was not sandboxed |
 | Private IPs in later hops | Normal after mail enters your Exchange — not treated as spoof by itself |
 
 ### Your own domains (skip this)
