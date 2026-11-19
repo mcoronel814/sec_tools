@@ -24,6 +24,7 @@ from dataclasses import asdict, dataclass, field
 from email.parser import BytesParser
 from email.policy import default
 from email.utils import parseaddr
+from pathlib import Path
 from typing import Any, Optional
 
 
@@ -32,6 +33,38 @@ from typing import Any, Optional
 # ---------------------------------------------------------------------------
 
 SEVERITY_ORDER = {"INFO": 0, "LOW": 1, "MEDIUM": 2, "HIGH": 3}
+SCRIPT_DIR = Path(__file__).resolve().parent
+ORG_WATCH = SCRIPT_DIR / "org_watch.txt"
+
+# IronPort SenderGroup words. Matched on tokens so NONSPAM does not contain SPAM.
+_RISK_GROUP_WORDS = ("SUSPECT", "BLACK", "BLOCK", "SPAM", "HBL")
+_SAFE_GROUP_WORDS = ("WHITE", "RELAYLIST", "TRUSTED", "ALLOWED")
+_FOREFRONT_HIGH_CATS = {"PHSH", "HPHSH", "PHISH", "MALW", "SPOOF", "HSPM"}
+_FOREFRONT_MED_CATS = {"SPM", "BULK"}
+_FOREFRONT_RISK_SFV = {"SPM", "SKS", "SKB"}
+_DMARC_STRONG = {"reject", "quarantine", "oreject"}
+# Parents of shared mail systems. A tenant under onmicrosoft.com can still be blocked.
+# A name under one of these cannot.
+_HUGE_MAIL_PARENTS = {
+    "sendgrid.net",
+    "secureserver.net",
+    "outlook.com",
+    "protection.outlook.com",
+    "office365.com",
+    "microsoft.com",
+    "google.com",
+    "googleapis.com",
+    "gstatic.com",
+}
+_SRS_LOCAL = re.compile(r"(?:^|[+=])srs\d*=", re.I)
+
+
+@dataclass
+class OrgWatch:
+    """Domains we send as, and display names that should only appear on them."""
+
+    domains: set[str] = field(default_factory=set)
+    names: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -63,6 +96,13 @@ class AnalysisResult:
     hops: list[dict[str, Any]] = field(default_factory=list)
     gateway: dict[str, Any] = field(default_factory=dict)
     max_severity: str = "INFO"
+    to_addr: str = ""
+    to_domain: str = ""
+    forwarder_domain: str = ""
+    received_as_bcc: bool = False
+    attachment_types: list[str] = field(default_factory=list)
+    signature_domains: list[str] = field(default_factory=list)
+    our_domains: set[str] = field(default_factory=set)
 
     def add(self, severity: str, category: str, message: str) -> None:
         self.findings.append(Finding(severity, category, message))
@@ -341,15 +381,22 @@ def parse_auth_results(headers) -> tuple[list[dict], list[dict], list[dict], lis
                 hd = re.search(r"(?:header\.from|d)=([^\s;]+)", rest, re.I)
                 if hd:
                     d_domain = hd.group(1).strip().lower()
-                # Policy from parenthetical: p=reject dis=none
+                # p= is the published policy. Microsoft puts the decision in action=.
                 policy = ""
                 disposition = ""
-                pm = re.search(r"\bp=(\w+)", reason, re.I)
+                blob = f"{reason} {rest}"
+                pm = re.search(r"\bp=(\w+)", blob, re.I)
                 if pm:
                     policy = pm.group(1).lower()
-                dm = re.search(r"\bdis=(\w+)", reason, re.I)
+                am = re.search(r"\baction=(\w+)", blob, re.I)
+                action = am.group(1).lower() if am else ""
+                if not policy and action in _DMARC_STRONG | {"none"}:
+                    policy = "reject" if action == "oreject" else action
+                dm = re.search(r"\bdis=(\w+)", blob, re.I)
                 if dm:
                     disposition = dm.group(1).lower()
+                elif action:
+                    disposition = action
                 dmarc_list.append({
                     "source": "Authentication-Results",
                     "result": result.lower(),
@@ -468,6 +515,7 @@ def collect_gateway_signals(headers) -> dict[str, Any]:
         "forefront_antispam": "X-Forefront-Antispam-Report",
         "tm_as_result": "X-TM-AS-Result",
         "amp_result": "X-Amp-Result",
+        "ironport_av": "X-IronPort-AV",
     }
     for key, hdr in mapping.items():
         val = headers.get(hdr)
@@ -480,6 +528,129 @@ def collect_gateway_signals(headers) -> dict[str, Any]:
 # Analysis
 # ---------------------------------------------------------------------------
 
+def load_org_watch(paths: tuple[Path, ...] | None = None) -> OrgWatch:
+    """Load org_watch.txt when it exists. A missing file means no org-specific checks."""
+    watch = OrgWatch()
+    for path in paths if paths is not None else (ORG_WATCH,):
+        if not path.is_file():
+            continue
+        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            if ":" in line:
+                kind, value = line.split(":", 1)
+            else:
+                kind, value = "domain", line
+            kind = kind.strip().lower()
+            value = value.strip()
+            if not value:
+                continue
+            if kind == "domain":
+                watch.domains.add(value.lower().rstrip("."))
+            elif kind == "name":
+                watch.names.append(value)
+    return watch
+
+
+def _dmarc_passed(result: AnalysisResult) -> bool:
+    return any((item.get("result") or "").lower() == "pass" for item in result.dmarc)
+
+
+def _aligned_dkim_pass(result: AnalysisResult) -> bool:
+    if not result.from_domain:
+        return False
+    for item in result.dkim:
+        domain = item.get("domain") or ""
+        if (item.get("result") or "").lower() == "pass" and domain and domains_align(domain, result.from_domain):
+            return True
+    return False
+
+
+def _is_mailing_list(headers) -> bool:
+    return bool(headers.get("List-Id") or headers.get("List-Unsubscribe"))
+
+
+def srs_forwarder_domain(return_path: str) -> str:
+    """Domain that rewrote the envelope, when the local part is SRS."""
+    if "@" not in return_path:
+        return ""
+    local, domain = return_path.rsplit("@", 1)
+    if not _SRS_LOCAL.search(local):
+        return ""
+    return domain.lower().rstrip(".")
+
+
+def ironport_attachment_types(value: str) -> list[str]:
+    """File types named in an X-IronPort-AV d= field."""
+    match = re.search(r'\bd="([^"]*)"', value, re.I)
+    if not match:
+        return []
+    types: list[str] = []
+    for token in re.findall(r"[A-Za-z0-9]+", match.group(1)):
+        if token.lower() == "scan" or token.isdigit():
+            continue
+        lowered = token.lower()
+        if lowered not in types:
+            types.append(lowered)
+    return types
+
+
+def _under_huge_mail_parent(domain: str) -> bool:
+    domain = domain.lower().rstrip(".")
+    if domain in _HUGE_MAIL_PARENTS or domain == "onmicrosoft.com":
+        return True
+    return any(domain.endswith("." + parent) for parent in _HUGE_MAIL_PARENTS)
+
+
+def _group_tokens(value: str) -> list[str]:
+    return re.findall(r"[A-Z0-9]+", value.upper())
+
+
+def _token_has_word(tokens: list[str], words: tuple[str, ...]) -> bool:
+    """True when a token is the word or starts with it (BLACKLIST, SUSPECTLIST)."""
+    for token in tokens:
+        for word in words:
+            if token == word or token.startswith(word):
+                return True
+    return False
+
+
+def _norm_label(label: str) -> str:
+    """Fold a few confusable characters so paypa1 and paypai meet paypal."""
+    folded = label.lower().replace("rn", "m")
+    return folded.translate(str.maketrans({"0": "o", "1": "l", "3": "e", "4": "a", "5": "s"}))
+
+
+def _registrable_label(domain: str) -> str:
+    org = org_domain(domain)
+    return org.split(".", 1)[0] if org else ""
+
+
+def _claims_our_domain(domain: str, watch: OrgWatch) -> bool:
+    return any(domains_align(domain, ours) for ours in watch.domains)
+
+
+def parse_forefront(value: str) -> dict[str, Any]:
+    """Split an X-Forefront-Antispam-Report into SCL, SFV, and CAT values."""
+    parsed: dict[str, Any] = {"scl": "", "sfv": "", "cats": []}
+    for part in value.split(";"):
+        if ":" not in part:
+            continue
+        key, raw_val = part.split(":", 1)
+        key = key.strip().upper()
+        val = raw_val.strip()
+        if not key or not val:
+            continue
+        if key == "CAT":
+            parsed["cats"].append(val.upper())
+        elif key == "SFV" and not parsed["sfv"]:
+            parsed["sfv"] = val.upper()
+        elif key == "SCL" and not parsed["scl"]:
+            parsed["scl"] = val
+    return parsed
+
+
 # Higher-signal subject patterns (avoid ultra-generic words like "file"/"review")
 SUBJECT_URGENCY = re.compile(
     r"\b("
@@ -491,14 +662,22 @@ SUBJECT_URGENCY = re.compile(
     r")\b",
     re.I,
 )
-SUBJECT_GATEWAY_TAG = re.compile(
-    r"\[?\s*(suspected\s*spam|spam|phish|external|caution|external\s*email)\s*\]?",
+# Whole words only. "precaution" must not match "caution", and "external"
+# inside a normal sentence is not a gateway tag.
+SUBJECT_RISK_TAG = re.compile(
+    r"\b(suspected\s+spam|spam|phish(?:ing)?)\b",
+    re.I,
+)
+SUBJECT_BANNER_TAG = re.compile(
+    r"\[(?:external(?:\s+email)?|caution)\]",
     re.I,
 )
 
 
-def analyze(headers, raw_header: str) -> AnalysisResult:
+def analyze(headers, raw_header: str, org: OrgWatch | None = None) -> AnalysisResult:
     r = AnalysisResult()
+    if org is None:
+        org = load_org_watch()
 
     # --- Core fields ---
     from_raw = headers.get("From")
@@ -519,6 +698,10 @@ def analyze(headers, raw_header: str) -> AnalysisResult:
 
     r.subject = " ".join(str(headers.get("Subject") or "").split()) or "(none)"
     r.to_addrs = " ".join(str(headers.get("To") or "").split()) or "(none)"
+    _, r.to_addr, r.to_domain = extract_address(headers.get("To"))
+    r.our_domains = set(org.domains)
+    r.forwarder_domain = srs_forwarder_domain(r.return_path)
+    r.received_as_bcc = bool(headers.get("X-MS-Exchange-Processed-By-BccFoldering"))
     r.message_id = " ".join(str(headers.get("Message-ID") or headers.get("Message-Id") or "").split())
     r.date = " ".join(str(headers.get("Date") or "").split())
 
@@ -530,9 +713,14 @@ def analyze(headers, raw_header: str) -> AnalysisResult:
     r.dkim = ar_dkim
     r.dmarc = ar_dmarc + parse_vendor_dmarc(headers, raw_header)
     dkim_sigs = parse_dkim_signatures(headers)
+    for sig in dkim_sigs:
+        signed = (sig.get("d") or "").lower().rstrip(".")
+        if signed and signed not in r.signature_domains:
+            r.signature_domains.append(signed)
 
     # --- Gateway ---
     r.gateway = collect_gateway_signals(headers)
+    r.attachment_types = ironport_attachment_types(str(r.gateway.get("ironport_av") or ""))
 
     # ========== Address / identity checks ==========
     if not r.from_addr:
@@ -573,6 +761,22 @@ def analyze(headers, raw_header: str) -> AnalysisResult:
                 f"From ({r.from_domain}) and Return-Path ({r.return_domain}) "
                 f"differ but share org domain ({org_domain(r.from_domain)}) — often legitimate (subdomain/ESP)",
             )
+        elif r.forwarder_domain:
+            r.add(
+                "MEDIUM",
+                "path",
+                f"Return-Path {r.return_path} was rewritten with SRS. "
+                f"{r.forwarder_domain} forwarded the message. "
+                f"That domain is not the From domain ({r.from_domain}).",
+            )
+        elif _dmarc_passed(r) or _is_mailing_list(headers):
+            why = "DMARC passed" if _dmarc_passed(r) else "mailing-list headers are present"
+            r.add(
+                "LOW",
+                "identity",
+                f"From ({r.from_domain}) and Return-Path ({r.return_domain}) differ ({why}). "
+                f"Often an ESP or mailing list.",
+            )
         else:
             r.add(
                 "MEDIUM",
@@ -583,15 +787,34 @@ def analyze(headers, raw_header: str) -> AnalysisResult:
     elif r.from_domain and not r.return_domain:
         r.add("LOW", "identity", "Return-Path missing or unparseable")
 
+    if r.received_as_bcc and r.to_addr:
+        watched = OrgWatch(domains=set(r.our_domains))
+        outside = bool(r.our_domains) and not (
+            r.to_domain and _claims_our_domain(r.to_domain, watched)
+        )
+        r.add(
+            "MEDIUM" if outside else "INFO",
+            "path",
+            f"A mailbox received this as a blind copy. Visible To is {r.to_addr}.",
+        )
+
     # Reply-To mismatch
     if r.reply_to and r.from_addr and r.reply_to != r.from_addr:
         if r.reply_to_domain and r.from_domain and not domains_align(r.reply_to_domain, r.from_domain):
-            r.add(
-                "HIGH",
-                "identity",
-                f"Reply-To domain ({r.reply_to_domain}) does not align with From ({r.from_domain}) — "
-                f"replies may go to an attacker-controlled address",
-            )
+            if _dmarc_passed(r):
+                r.add(
+                    "MEDIUM",
+                    "identity",
+                    f"Reply-To ({r.reply_to}) is on {r.reply_to_domain}, while From "
+                    f"({r.from_domain}) passed DMARC. Confirm replies should go there.",
+                )
+            else:
+                r.add(
+                    "HIGH",
+                    "identity",
+                    f"Reply-To domain ({r.reply_to_domain}) does not align with From ({r.from_domain}) — "
+                    f"replies may go to an attacker-controlled address",
+                )
         else:
             r.add(
                 "LOW",
@@ -698,6 +921,7 @@ def analyze(headers, raw_header: str) -> AnalysisResult:
                 f"but no Authentication-Results dkim= verdict — cannot confirm verification",
             )
     else:
+        aligned_pass = _aligned_dkim_pass(r)
         for d in r.dkim:
             res = (d.get("result") or "").lower()
             ddom = d.get("domain") or ""
@@ -718,22 +942,34 @@ def analyze(headers, raw_header: str) -> AnalysisResult:
                 else:
                     r.add("INFO", "dkim", f"DKIM PASS (domain={ddom or 'unknown'})")
             elif res == "fail":
-                r.add("HIGH", "dkim", f"DKIM FAIL — signature invalid or body/header modified ({ddom or 'unknown domain'})")
+                if aligned_pass:
+                    r.add(
+                        "INFO",
+                        "dkim",
+                        f"Extra DKIM signature for {ddom or 'unknown domain'} did not verify. "
+                        f"A signature aligned with From ({r.from_domain}) passed.",
+                    )
+                else:
+                    r.add(
+                        "HIGH",
+                        "dkim",
+                        f"DKIM FAIL — signature invalid or body/header modified ({ddom or 'unknown domain'})",
+                    )
             elif res == "none":
                 r.add("LOW", "dkim", "DKIM none — no signature validated")
             else:
                 r.add("LOW", "dkim", f"DKIM result '{res}' domain={ddom or '?'}")
 
-        # Signature d= vs AR
-        for sig in dkim_sigs:
-            if sig["d"] and r.from_domain and not domains_align(sig["d"], r.from_domain):
-                # Only note if we didn't already flag misalignment via AR
-                if not any("does not align" in f.message for f in r.findings if f.category == "dkim"):
-                    r.add(
-                        "MEDIUM",
-                        "dkim",
-                        f"DKIM-Signature d={sig['d']} does not align with From {r.from_domain}",
-                    )
+        # Signature d= vs AR. An aligned passing result already explains a list signature.
+        if not aligned_pass:
+            for sig in dkim_sigs:
+                if sig["d"] and r.from_domain and not domains_align(sig["d"], r.from_domain):
+                    if not any("does not align" in f.message for f in r.findings if f.category == "dkim"):
+                        r.add(
+                            "MEDIUM",
+                            "dkim",
+                            f"DKIM-Signature d={sig['d']} does not align with From {r.from_domain}",
+                        )
 
     # ========== DMARC ==========
     if not r.dmarc:
@@ -762,14 +998,15 @@ def analyze(headers, raw_header: str) -> AnalysisResult:
             if res == "pass":
                 r.add("INFO", "dmarc", f"DMARC PASS{extra} — SPF/DKIM aligned with From domain policy")
             elif res == "fail":
-                sev = "HIGH" if policy in ("reject", "quarantine") else "MEDIUM"
+                strong = policy in _DMARC_STRONG or disp in _DMARC_STRONG
+                sev = "HIGH" if strong else "MEDIUM"
                 r.add(
                     sev,
                     "dmarc",
                     f"DMARC FAIL{extra} — message does not align; "
                     + (
-                        "domain owner requests reject/quarantine"
-                        if policy in ("reject", "quarantine")
+                        "domain owner or gateway requests reject/quarantine"
+                        if strong
                         else "domain policy may be none (monitoring only)"
                     ),
                 )
@@ -850,14 +1087,15 @@ def analyze(headers, raw_header: str) -> AnalysisResult:
 
     # ========== Gateway reputation ==========
     g = r.gateway
-    sg = (g.get("ironport_sender_group") or "").upper()
+    sg = g.get("ironport_sender_group") or ""
     if sg:
-        if any(x in sg for x in ("SUSPECT", "BLACK", "BLOCK", "SPAM", "HBL")):
-            r.add("HIGH", "gateway", f"IronPort SenderGroup indicates risk: {g['ironport_sender_group']}")
-        elif any(x in sg for x in ("WHITE", "RELAYLIST", "TRUSTED", "ALLOWED")):
-            r.add("INFO", "gateway", f"IronPort SenderGroup: {g['ironport_sender_group']}")
+        tokens = _group_tokens(sg)
+        if _token_has_word(tokens, _RISK_GROUP_WORDS):
+            r.add("HIGH", "gateway", f"IronPort SenderGroup indicates risk: {sg}")
+        elif _token_has_word(tokens, _SAFE_GROUP_WORDS):
+            r.add("INFO", "gateway", f"IronPort SenderGroup: {sg}")
         else:
-            r.add("LOW", "gateway", f"IronPort SenderGroup: {g['ironport_sender_group']}")
+            r.add("LOW", "gateway", f"IronPort SenderGroup: {sg}")
 
     if g.get("ironport_reputation"):
         try:
@@ -905,6 +1143,60 @@ def analyze(headers, raw_header: str) -> AnalysisResult:
         else:
             r.add("INFO", "gateway", f"Exchange AuthAs={auth_as}")
 
+    if g.get("forefront_antispam"):
+        ff = parse_forefront(g["forefront_antispam"])
+        bits: list[str] = []
+        sev_rank = 0
+        high_cats = [cat for cat in ff["cats"] if cat in _FOREFRONT_HIGH_CATS]
+        med_cats = [cat for cat in ff["cats"] if cat in _FOREFRONT_MED_CATS]
+        if high_cats:
+            bits.append("CAT=" + ",".join(high_cats))
+            sev_rank = 3
+        elif med_cats:
+            bits.append("CAT=" + ",".join(med_cats))
+            sev_rank = max(sev_rank, 2)
+        sfv = ff["sfv"]
+        if sfv in _FOREFRONT_RISK_SFV:
+            bits.append(f"SFV={sfv}")
+            sev_rank = 3
+        ff_scl = None
+        if ff["scl"]:
+            try:
+                ff_scl = int(str(ff["scl"]).split()[0])
+            except ValueError:
+                ff_scl = None
+            if ff_scl is not None:
+                bits.append(f"SCL={ff_scl}")
+                if ff_scl >= 7:
+                    sev_rank = 3
+                elif ff_scl >= 5:
+                    sev_rank = max(sev_rank, 2)
+                elif ff_scl >= 1:
+                    sev_rank = max(sev_rank, 1)
+        exchange_scl = None
+        if g.get("ms_scl") is not None:
+            try:
+                exchange_scl = int(str(g["ms_scl"]).split()[0])
+            except ValueError:
+                exchange_scl = None
+        disagreement = ""
+        if ff_scl is not None and exchange_scl is not None and ff_scl != exchange_scl:
+            disagreement = (
+                f" Exchange SCL={exchange_scl} disagrees; that score is from a later hop."
+            )
+        if bits and sev_rank >= 2:
+            severity = "HIGH" if sev_rank >= 3 else "MEDIUM"
+            r.add(severity, "gateway", "Forefront antispam: " + " ".join(bits) + "." + disagreement)
+        elif bits:
+            r.add("LOW", "gateway", "Forefront antispam: " + " ".join(bits) + "." + disagreement)
+
+    if r.attachment_types:
+        r.add(
+            "INFO",
+            "content",
+            "IronPort scanned attachment type(s): " + ", ".join(r.attachment_types),
+        )
+
     if g.get("threat_scanner"):
         tv = g["threat_scanner"]
         if tv.lower() not in ("negative", "clean", "n/a", ""):
@@ -912,12 +1204,63 @@ def analyze(headers, raw_header: str) -> AnalysisResult:
         else:
             r.add("INFO", "gateway", f"Threat scanner: {tv}")
 
+    # ========== Our domains and watched display names ==========
+    if org.domains and r.from_domain and _claims_our_domain(r.from_domain, org):
+        spf_fail = any(
+            (item.get("result") or "").lower() in ("fail", "softfail")
+            and (item.get("identity") or "") != "helo"
+            for item in r.spf
+        )
+        dmarc_fail = any((item.get("result") or "").lower() == "fail" for item in r.dmarc)
+        if dmarc_fail or (spf_fail and not _aligned_dkim_pass(r)):
+            r.add(
+                "HIGH",
+                "identity",
+                f"From uses our domain {r.from_domain} but authentication failed — "
+                f"treat as impersonation",
+            )
+    elif org.domains and r.from_domain and not _claims_our_domain(r.from_domain, org):
+        their_label = _norm_label(_registrable_label(r.from_domain))
+        for ours in sorted(org.domains):
+            our_label = _norm_label(_registrable_label(ours))
+            if their_label and our_label and their_label == our_label:
+                r.add(
+                    "HIGH",
+                    "identity",
+                    f"From domain {r.from_domain} looks like our domain {ours}",
+                )
+                break
+
+    if (
+        org.names
+        and org.domains
+        and r.from_display
+        and r.from_domain
+        and not _claims_our_domain(r.from_domain, org)
+    ):
+        display_lower = r.from_display.lower()
+        for watched in org.names:
+            if watched.lower() in display_lower:
+                r.add(
+                    "HIGH",
+                    "identity",
+                    f"Watched display name '{watched}' is on {r.from_addr or r.from_domain}, "
+                    f"which is not our domain",
+                )
+                break
+
     # ========== Subject / weak phishing heuristics ==========
-    if SUBJECT_GATEWAY_TAG.search(r.subject):
+    if SUBJECT_RISK_TAG.search(r.subject):
         r.add(
             "MEDIUM",
             "content",
-            f"Subject carries gateway/external tag: {r.subject!r}",
+            f"Subject matches a spam or phish tag: {r.subject!r}",
+        )
+    elif SUBJECT_BANNER_TAG.search(r.subject):
+        r.add(
+            "INFO",
+            "content",
+            f"Subject has an external/caution banner: {r.subject!r}",
         )
     if SUBJECT_URGENCY.search(r.subject):
         r.add(
@@ -985,6 +1328,10 @@ def is_clear_spoof_finding(f: Finding) -> bool:
             return True
         if "reply-to domain" in msg and "does not align" in msg:
             return True
+        if "treat as impersonation" in msg or "looks like our domain" in msg:
+            return True
+        if msg.startswith("watched display name"):
+            return True
         if "missing or unparseable from" in msg:
             return True
         if "sender header" in msg and "does not align" in msg:
@@ -993,6 +1340,154 @@ def is_clear_spoof_finding(f: Finding) -> bool:
         if "from domain" in msg and "return-path domain" in msg and "!=" in f.message:
             return True
     return False
+
+
+def _path_notes(r: AnalysisResult) -> list[str]:
+    notes: list[str] = []
+    if r.forwarder_domain:
+        notes.append(f"Return-Path was rewritten with SRS by {r.forwarder_domain}.")
+
+    other_dkim: list[str] = []
+    for item in r.dkim:
+        domain = (item.get("domain") or "").lower().rstrip(".")
+        if (item.get("result") or "").lower() != "pass" or not domain:
+            continue
+        if r.from_domain and domains_align(domain, r.from_domain):
+            continue
+        if domain not in other_dkim and not _under_huge_mail_parent(domain):
+            other_dkim.append(domain)
+    if other_dkim:
+        notes.append(
+            "Passing DKIM for a domain other than From: " + ", ".join(other_dkim) + "."
+        )
+
+    infra: list[str] = []
+    for signed in r.signature_domains:
+        if r.from_domain and domains_align(signed, r.from_domain):
+            continue
+        if _under_huge_mail_parent(signed) and signed not in infra:
+            infra.append(signed)
+    if infra:
+        notes.append(
+            "Also signed through shared mail infrastructure: "
+            + ", ".join(infra)
+            + ". Those names are not block targets."
+        )
+
+    if r.received_as_bcc and r.to_addr:
+        notes.append(f"Received as a blind copy. Visible To is {r.to_addr}.")
+    if r.attachment_types:
+        notes.append(
+            "IronPort scanned attachment type(s): " + ", ".join(r.attachment_types) + "."
+        )
+    return notes
+
+
+def _block_advice(r: AnalysisResult) -> tuple[list[str], list[str], list[str]]:
+    """Return (block, confirm, do_not_block) lines."""
+    block: list[str] = []
+    confirm: list[str] = []
+    spare: list[str] = []
+    seen: set[str] = set()
+    watched = OrgWatch(domains=set(r.our_domains))
+
+    def add(bucket: list[str], value: str, reason: str) -> None:
+        key = value.lower()
+        if not value or key in seen:
+            return
+        seen.add(key)
+        bucket.append(f"{value} — {reason}")
+
+    def ours(domain: str) -> bool:
+        return bool(domain) and bool(r.our_domains) and _claims_our_domain(domain, watched)
+
+    if (
+        r.forwarder_domain
+        and not ours(r.forwarder_domain)
+        and not _under_huge_mail_parent(r.forwarder_domain)
+        and not (r.from_domain and domains_align(r.forwarder_domain, r.from_domain))
+    ):
+        add(
+            block,
+            r.forwarder_domain,
+            "SRS forwarder domain. The bounce address is one-time; block the domain.",
+        )
+
+    if (
+        r.received_as_bcc
+        and r.to_addr
+        and r.to_domain
+        and r.our_domains
+        and not ours(r.to_domain)
+    ):
+        add(
+            block,
+            r.to_addr,
+            "Visible recipient. A mailbox here received this as a blind copy.",
+        )
+        if not _under_huge_mail_parent(r.to_domain):
+            add(block, r.to_domain, "Domain of that visible recipient.")
+
+    for item in r.dkim:
+        domain = (item.get("domain") or "").lower().rstrip(".")
+        if (item.get("result") or "").lower() != "pass" or not domain:
+            continue
+        if r.from_domain and domains_align(domain, r.from_domain):
+            continue
+        if ours(domain) or _under_huge_mail_parent(domain):
+            continue
+        add(
+            block,
+            domain,
+            "DKIM passed for this name, which is not the From domain. "
+            "Block this name only, not its parent.",
+        )
+
+    if (
+        r.reply_to
+        and r.reply_to_domain
+        and r.from_domain
+        and not domains_align(r.reply_to_domain, r.from_domain)
+    ):
+        if _dmarc_passed(r):
+            add(
+                confirm,
+                r.reply_to,
+                "Reply-To is a different domain. From itself passed DMARC.",
+            )
+        else:
+            add(
+                block,
+                r.reply_to,
+                "Reply-To does not match From, and From did not pass DMARC.",
+            )
+
+    spoof = any(is_clear_spoof_finding(f) for f in r.findings)
+    if spoof and not _dmarc_passed(r) and r.from_addr and not ours(r.from_domain):
+        add(block, r.from_addr, "From is part of a spoof finding, and DMARC did not pass.")
+
+    if _dmarc_passed(r) and r.from_addr:
+        add(spare, r.from_addr, f"DMARC passed for {r.from_domain or 'the From domain'}.")
+    return block, confirm, spare
+
+
+def _advice_lines(r: AnalysisResult) -> list[str]:
+    lines: list[str] = []
+    notes = _path_notes(r)
+    block, confirm, spare = _block_advice(r)
+    if notes:
+        lines.append("What the path shows:")
+        lines.extend(f"  • {note}" for note in notes)
+    if block:
+        lines.append("Addresses and domains to block:")
+        lines.extend(f"  • {item}" for item in block)
+    if confirm:
+        lines.append("Confirm before blocking:")
+        lines.extend(f"  • {item}" for item in confirm)
+    if spare and (block or confirm):
+        lines.append("Do not block:")
+        lines.extend(f"  • {item}" for item in spare)
+    return lines
 
 
 def recommended_action(r: AnalysisResult) -> dict[str, Any]:
@@ -1008,7 +1503,8 @@ def recommended_action(r: AnalysisResult) -> dict[str, Any]:
     high = [f for f in r.findings if f.severity == "HIGH"]
     med = [f for f in r.findings if f.severity == "MEDIUM"]
     high_spoof = [f for f in spoof if f.severity == "HIGH"]
-    # MEDIUM spoof (e.g. DMARC fail with p=none, From/Return-Path mismatch) still warrants block posture
+    # DMARC fail (including p=none) still warrants a block posture.
+    # A From/Return-Path mismatch does not, once DMARC passed or the message is a list.
     med_spoof = [f for f in spoof if f.severity == "MEDIUM"]
 
     domains: list[str] = []
@@ -1032,6 +1528,7 @@ def recommended_action(r: AnalysisResult) -> dict[str, Any]:
             lines.append(f"  • Consider gateway block / watch on: {', '.join(domains)}{extra}")
         lines.append("  • If brand impersonation: report to the real brand's abuse channel if appropriate.")
         lines.append("  • Skim body only in a safe viewer if you need IOCs (URLs, hashes).")
+        lines.extend(_advice_lines(r))
         return {"action": level, "spoof_findings": len(spoof), "lines": lines}
 
     if high:
@@ -1045,6 +1542,7 @@ def recommended_action(r: AnalysisResult) -> dict[str, Any]:
         ]
         for f in high:
             lines.append(f"  - [{f.category}] {f.message}")
+        lines.extend(_advice_lines(r))
         return {"action": level, "spoof_findings": 0, "lines": lines}
 
     if med:
@@ -1054,6 +1552,7 @@ def recommended_action(r: AnalysisResult) -> dict[str, Any]:
             "Elevated (MEDIUM) signals present; spoofing is not confirmed from headers.",
             "Verify content, brand impersonation, user context, and any gateway tags.",
         ]
+        lines.extend(_advice_lines(r))
         return {"action": level, "spoof_findings": 0, "lines": lines}
 
     level = "MONITOR"
@@ -1062,6 +1561,7 @@ def recommended_action(r: AnalysisResult) -> dict[str, Any]:
         "No high/medium header red flags. Headers look relatively clean.",
         "Still verify: unexpected sender? user expected this? links/attachments?",
     ]
+    lines.extend(_advice_lines(r))
     return {"action": level, "spoof_findings": 0, "lines": lines}
 
 
@@ -1191,6 +1691,8 @@ def result_to_json(r: AnalysisResult) -> str:
         "max_severity": r.max_severity,
         "recommended_action": action["action"],
         "recommended_action_detail": action["lines"],
+        "block": _block_advice(r)[0],
+        "do_not_block": _block_advice(r)[2],
         "findings": [asdict(f) for f in sorted(r.findings, key=_sev_sort_key)],
         "spf": r.spf,
         "dkim": r.dkim,

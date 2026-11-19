@@ -5,6 +5,7 @@ Normalize an IOC list text file for proxy / firewall blocklists:
   - Light-refang defanged URLs (hxxps, [.] …)
   - URLs → hostname (FQDN or IP), EXCEPT when the host is on the
     shared/legit platform list (then the URL is kept)
+  - A shared or exact platform name with no path is left out of the file
   - Lowercase
   - Deduplicate (order preserved)
   - Write results back to the same file (in-place)
@@ -13,7 +14,8 @@ Usage:
   python3 ioc_txt_trimmer.py
   python3 ioc_txt_trimmer.py path/to/iocs.txt
   python3 ioc_txt_trimmer.py --keep-urls          # never collapse URLs
-  python3 ioc_txt_trimmer.py --hosts-only         # always collapse URLs
+  python3 ioc_txt_trimmer.py --hosts-only         # collapse URLs, still
+                                                  # protect platform names
 """
 
 from __future__ import annotations
@@ -27,13 +29,26 @@ from urllib.parse import urlparse
 
 DEFAULT_INPUT = "ioc.txt"
 SCRIPT_DIR = Path(__file__).resolve().parent
-DEFAULT_SHARED = SCRIPT_DIR / "shared_hosts.txt"
-LOCAL_SHARED = SCRIPT_DIR / "shared_hosts.local.txt"
+DEFAULT_SHARED = SCRIPT_DIR / "lists" / "shared_hosts.txt"
+LOCAL_SHARED = SCRIPT_DIR / "lists" / "shared_hosts.local.txt"
+DEFAULT_EXACT = SCRIPT_DIR / "lists" / "never_block_exact.txt"
 
 _HASH_RE = re.compile(r"^[a-fA-F0-9]{32}$|^[a-fA-F0-9]{40}$|^[a-fA-F0-9]{64}$")
 _HOST_PATH_RE = re.compile(
     r"^(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}(?::\d+)?/.",
 )
+
+
+def load_host_lines(path: Path) -> set[str]:
+    hosts: set[str] = set()
+    if not path.is_file():
+        return hosts
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        hosts.add(line.lower().rstrip("."))
+    return hosts
 
 
 def load_shared_hosts(extra_path: Path | None) -> set[str]:
@@ -42,14 +57,17 @@ def load_shared_hosts(extra_path: Path | None) -> set[str]:
     if extra_path is not None:
         paths.append(extra_path)
     for path in paths:
-        if not path.is_file():
-            continue
-        for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            hosts.add(line.lower().rstrip("."))
+        hosts.update(load_host_lines(path))
     return hosts
+
+
+def load_exact_platform_names() -> set[str]:
+    """Hostnames that must never be the entire indicator.
+
+    A tenant under one of these (evil.workers.dev) is still allowed.
+    The name itself (workers.dev, cdn.jsdelivr.net) is not.
+    """
+    return load_host_lines(DEFAULT_EXACT)
 
 
 def is_shared_host(host: str, shared: set[str]) -> bool:
@@ -64,6 +82,40 @@ def is_shared_host(host: str, shared: set[str]) -> bool:
         if ".".join(labels[i:]) in shared:
             return True
     return False
+
+
+def host_without_port(token: str) -> str:
+    """Drop a numeric :port from a bare hostname. Leave every other token."""
+    host, sep, port = token.rpartition(":")
+    if sep and host and port.isdigit() and ":" not in host:
+        return host
+    return token
+
+
+def is_exact_platform_name(host: str, exact: set[str]) -> bool:
+    return host.lower().rstrip(".") in exact
+
+
+def is_protected_platform(host: str, shared: set[str], exact: set[str]) -> bool:
+    """True when writing this hostname would block a shared service."""
+    host = host.lower().rstrip(".")
+    if is_exact_platform_name(host, exact):
+        return True
+    return is_shared_host(host, shared)
+
+
+def url_has_path(token: str) -> bool:
+    """True when the URL carries a path, query, or fragment beyond the host."""
+    candidate = token
+    if candidate.startswith("//"):
+        candidate = "http:" + candidate
+    elif "://" not in candidate:
+        candidate = "http://" + candidate
+    parsed = urlparse(candidate)
+    if parsed.query or parsed.fragment:
+        return True
+    path = parsed.path or ""
+    return path not in ("", "/")
 
 
 def refang(token: str) -> str:
@@ -134,11 +186,16 @@ def normalize_token(
     raw_token: str,
     shared: set[str],
     mode: str,
+    exact: set[str] | None = None,
 ) -> tuple[str, str | None]:
     """
     Return (normalized_value, warning_or_None).
+
+    An empty value with a ``refused platform name`` warning means the
+    indicator was held back and must not be written.
     mode: 'hybrid' | 'keep-urls' | 'hosts-only'
     """
+    exact = exact if exact is not None else set()
     token = refang(raw_token.strip())
     if not token:
         return "", None
@@ -147,22 +204,27 @@ def normalize_token(
         return token.lower(), None
 
     if not looks_like_url(token):
-        return token.lower().rstrip("."), None
+        bare = token.lower().rstrip(".")
+        host = host_without_port(bare)
+        if is_protected_platform(host, shared, exact):
+            return "", f"refused platform name: {host}"
+        return bare, None
 
     host = url_hostname(token)
     if not host:
         return token.lower(), None
 
+    if is_protected_platform(host, shared, exact):
+        if url_has_path(token):
+            kept = normalize_url(token)
+            return kept, f"kept URL (shared host {host}): {kept}"
+        return "", f"refused platform name: {host}"
+
     if mode == "keep-urls":
         return normalize_url(token), None
 
-    if mode == "hosts-only":
-        return host, None
-
-    # hybrid
-    if is_shared_host(host, shared):
-        kept = normalize_url(token)
-        return kept, f"kept URL (shared host {host}): {kept}"
+    # hybrid and hosts-only. Platform names are already handled above,
+    # including in hosts-only, so a CDN host is not written from this branch.
     return host, None
 
 
@@ -170,6 +232,7 @@ def process_file(
     file_path: str,
     shared: set[str],
     mode: str,
+    exact: set[str] | None = None,
 ) -> int:
     try:
         with open(file_path, "r", encoding="utf-8", errors="replace") as file:
@@ -177,25 +240,30 @@ def process_file(
     except FileNotFoundError:
         print(
             f"Error: '{file_path}' not found.\n"
-            f"  cp ioc.txt.example {file_path}\n"
+            f"  cp examples/ioc.txt.example {file_path}\n"
             "  Then paste IOCs (one per line) and re-run.",
             file=sys.stderr,
         )
         return 1
 
+    exact = exact if exact is not None else set()
     unique_results: set[str] = set()
     processed_lines: list[str] = []
     kept_url = 0
     collapsed = 0
     other = 0
+    refused = 0
 
     for line in lines:
         line = line.strip()
         if not line or line.startswith("#"):
             continue
         first = line.split(None, 1)[0]
-        result, note = normalize_token(first, shared, mode)
+        result, note = normalize_token(first, shared, mode, exact)
         if not result:
+            if note:
+                print(note, file=sys.stderr)
+                refused += 1
             continue
         if note:
             print(note, file=sys.stderr)
@@ -214,14 +282,23 @@ def process_file(
 
     print(
         f"\nWrote {len(processed_lines)} unique IOC(s) to {file_path}"
-        f"  (collapsed URLs→host: {collapsed}, kept shared URLs: {kept_url}, other: {other})",
+        f"  (collapsed URLs→host: {collapsed}, kept URLs: {kept_url},"
+        f" other: {other}, refused platform names: {refused})",
         file=sys.stderr,
     )
+    if refused:
+        print(
+            "Those platform names were left out of the file. "
+            "Writing them would block the whole service.",
+            file=sys.stderr,
+        )
     if mode == "hybrid" and not shared:
         print(
             "Warning: shared-host list is empty — every URL was collapsed to a hostname.",
             file=sys.stderr,
         )
+    if refused:
+        return 1
     return 0
 
 
@@ -229,7 +306,8 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description=(
             "Trim, lowercase, and dedupe an IOC text file in place. "
-            "URLs become hostnames unless the host is on the shared/legit list."
+            "URLs become hostnames unless the host is on the shared/legit list. "
+            "A platform name with no path is left out of the file."
         ),
     )
     parser.add_argument(
@@ -247,13 +325,16 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument(
         "--hosts-only",
         action="store_true",
-        help="Always collapse URLs to hostnames (ignore the shared-host list).",
+        help=(
+            "Collapse URLs to hostnames. A platform name is still kept as a "
+            "URL when it has a path, and left out when it does not."
+        ),
     )
     parser.add_argument(
         "--shared-hosts",
         type=Path,
         default=None,
-        help="Extra shared-host file (merged with shared_hosts.txt).",
+        help="Extra shared-host file (merged with lists/shared_hosts.txt).",
     )
     args = parser.parse_args(argv)
 
@@ -270,7 +351,14 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     shared = load_shared_hosts(extra)
-    return process_file(args.file_path, shared, run_mode)
+    exact = load_exact_platform_names()
+    if not DEFAULT_EXACT.is_file():
+        print(
+            f"Warning: '{DEFAULT_EXACT.name}' was not found. "
+            "Exact platform names will not be refused.",
+            file=sys.stderr,
+        )
+    return process_file(args.file_path, shared, run_mode, exact)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,11 @@
+# Optional. The header analyzer works if you never create org_watch.txt.
+#
+# Copy this file to org_watch.txt in the repo folder and list domains your organization sends as.
+# Mail that claims one of those domains and fails SPF or DMARC is marked as
+# impersonation. A near-copy of the name is marked too.
+# A display name listed here is marked when it appears on any other domain,
+# even when that domain's authentication passed.
+#
+# domain:example.gov
+# domain:mail.example.gov
+# name:IT Helpdesk

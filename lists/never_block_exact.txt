@@ -1,0 +1,23 @@
+# Exact hostnames that must never be written as a block by themselves.
+#
+# A line that is only one of these names is left out of the IOC file.
+# A URL whose host is exactly one of these is kept as a URL, because the
+# path is the indicator.
+# A tenant under the name is still reduced to that tenant:
+#   evil-tenant.workers.dev  is written
+#   workers.dev              is refused
+#
+# Parents such as googleapis.com belong in lists/shared_hosts.txt. That list
+# also covers every name under them (storage.googleapis.com, and so on).
+#
+# One host per line. Lines starting with # are comments.
+
+cdn.jsdelivr.net
+unpkg.com
+cdnjs.cloudflare.com
+blob.core.windows.net
+workers.dev
+github.io
+netlify.app
+azurewebsites.net
+b-cdn.net

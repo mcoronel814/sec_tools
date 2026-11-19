@@ -11,6 +11,23 @@ You stay in control. These tools do **not** change your mail gateway, firewall, 
 | I copied IOCs from reports — clean them for a blocklist | IOC list trimmer | `ioc.txt` |
 | I have MD5/SHA-1 hashes — I need SHA-256 for a search | VirusTotal hash helper | `sha1_list.txt` |
 
+## How the folder is laid out
+
+Stay in this top folder. Paste here, and run the three commands from here. The tools look for `header.txt`, `ioc.txt`, and `sha1_list.txt` in this folder, not inside a subfolder.
+
+The other folders are here so the top stays small.
+
+| What you see | Why it is separate | What you do with it |
+|--------------|--------------------|---------------------|
+| The three `.py` files | Each one is a tool | Run it. You do not need to open it |
+| `header.txt`, `ioc.txt`, `sha1_list.txt` | Your case data. It changes often and can be sensitive, so git ignores it | Paste into these. They appear after the copy step below |
+| `org_watch.txt` | Optional list of *your* domains. Not in git | Create it only if you want impersonation checks. Skip it and the header tool still works |
+| `examples/` | Blank templates, safe to publish | Copy a template up to this folder once. Do not paste real headers or IOCs inside `examples/` |
+| `lists/` | Host lists the IOC trimmer uses so it does not block a whole platform | Leave these alone for normal use. Add a private extra in `lists/shared_hosts.local.txt` if you need one |
+| `tests/` | Checks that the tools still behave after a code change | Ignore this for daily work. People changing the scripts run `python3 -m unittest discover -s tests` |
+
+`.env` is the same idea as the paste files: your VirusTotal key, kept on your machine, not in git. `.env.example` is only the empty shape of that file.
+
 ---
 
 ## First-time setup
@@ -32,9 +49,9 @@ The repo does **not** ship your real investigation data (headers, IOCs, hashes).
 Those files change every case and can be sensitive. Copy the templates:
 
 ```bash
-cp header.txt.example header.txt
-cp ioc.txt.example ioc.txt
-cp sha1_list.txt.example sha1_list.txt
+cp examples/header.txt.example header.txt
+cp examples/ioc.txt.example ioc.txt
+cp examples/sha1_list.txt.example sha1_list.txt
 ```
 
 Then, for each case, **replace** the example text with your real paste.
@@ -45,7 +62,7 @@ Then, for each case, **replace** the example text with your real paste.
 | `ioc.txt` | IOC trimmer | One IOC per line (hash, domain, URL, IP, …) |
 | `sha1_list.txt` | VirusTotal helper | One file hash per line (MD5, SHA-1, or SHA-256) |
 
-The `*.example` files stay in git as pictures of the format. Your real `header.txt` / `ioc.txt` / `sha1_list.txt` are ignored by git on purpose.
+The templates live in `examples/`. Your real `header.txt`, `ioc.txt`, and `sha1_list.txt` stay in this folder and are ignored by git on purpose.
 
 ### 3. VirusTotal only (skip this if you only use headers + IOCs)
 
@@ -88,7 +105,7 @@ No live DNS. The tool only reads what is **already in the headers** (including `
 ### 1. Create your working file (once)
 
 ```bash
-cp header.txt.example header.txt
+cp examples/header.txt.example header.txt
 ```
 
 ### 2. Paste the headers into `header.txt`
@@ -124,7 +141,7 @@ A text report with five parts:
 
 | Action | Meaning | Typical cause |
 |--------|---------|----------------|
-| **BLOCK** | Quarantine / delete; do not click or reply | Clear spoof signals: SPF/DKIM/DMARC **fail**, display-name spoof, Reply-To on another domain |
+| **BLOCK** | Quarantine / delete; do not click or reply | Clear spoof signals: SPF/DKIM/DMARC **fail**, display-name spoof, Reply-To on another domain when From itself did not pass DMARC, or mail that claims one of your domains and fails auth |
 | **QUARANTINE** | Hold it; treat as bad until proven safe | No classic spoof, but HIGH gateway risk (e.g. IronPort `SUSPECTLIST`) |
 | **INVESTIGATE** | Do not clear on headers alone | Medium signals only — check body, user context, brand impersonation |
 | **MONITOR** | Headers look relatively clean | Still ask: did the user expect this sender? Any links/attachments? |
@@ -162,9 +179,24 @@ A different real-world shape: **SPF/DKIM/DMARC all PASS**, but IronPort tagged `
 | SPF / DKIM / DMARC **PASS** | Gateway accepted the sending domain as aligned |
 | SPF / DKIM / DMARC **FAIL** | Sending IP or signature does not match the claimed domain — strong spoof/break signal |
 | Display-name spoofing | The friendly name looks like a trusted address; the real From is someone else |
-| Reply-To domain does not align | Replies may go to an attacker mailbox |
-| IronPort SenderGroup / negative reputation | Your *existing* email filter already distrusts this source |
+| Reply-To domain does not align | Replies may go to an attacker mailbox. If From passed DMARC, this stays a medium “check it” finding |
+| From / Return-Path differ, DMARC passed | Usual for a mailing service. Not a block |
+| `SRS=` on the Return-Path | A forwarder rewrote the envelope. The takeaway names that domain as the block, and tells you not to block a From that passed DMARC |
+| Blind copy, visible To is someone else | When your domains are in `org_watch.txt`, that outside address is listed to block |
+| Watched display name, or a lookalike of your domain | Only if you created `org_watch.txt`. A helpdesk name, or a near-copy of your domain, on someone else’s mail |
+| IronPort SenderGroup / negative reputation | Your *existing* email filter already distrusts this source. `NONSPAM` is not read as spam |
+| Forefront `CAT:PHSH`, `SFV:SPM`, or `SCL:` | Exchange already marked phish or spam. Counted even when the separate SCL header is absent |
 | Private IPs in later hops | Normal after mail enters your Exchange — not treated as spoof by itself |
+
+### Your own domains (skip this)
+
+The analyzer does not need to know where you work. Impersonation checks for *your* domains run only if you create `org_watch.txt`:
+
+```bash
+cp examples/org_watch.txt.example org_watch.txt
+```
+
+Open it, uncomment a `domain:` line, and put your real domain there. Add a `name:` line for a display name that should only appear on your mail, such as your helpdesk. Leave the file out and every other check still runs. `org_watch.txt` is not uploaded to git.
 
 ### Optional switches (you can ignore these)
 
@@ -187,7 +219,7 @@ No programming needed. You only edit a text file and run one command.
 ### 1. Create your working file (once)
 
 ```bash
-cp ioc.txt.example ioc.txt
+cp examples/ioc.txt.example ioc.txt
 ```
 
 ### 2. Paste IOCs into `ioc.txt`
@@ -252,12 +284,19 @@ Notice:
 | `https://t.me/+InviteCodeHere` | **URL kept** | `t.me` is on the shared-host list — blocking the host would block Telegram |
 | `https://dictanote.co/n/1393926/` | **URL kept** | Shared/legit product; the **path** is the IOC |
 | `dub.sh/6SaEhaD` | **URL kept** | Shortener — you want this exact link, not all of `dub.sh` |
+| `storage.googleapis.com` | **left out** | Shared platform, no path. Printed as `refused platform name` |
+| `storage[.]googleapis[.]com` | **left out** | Same name after defang repair. Still no path |
+| `https://storage.googleapis.com/bucket/malware.exe` | **URL kept** | Same host, and the path is the IOC |
+| `https://cdn.jsdelivr.net/npm/left-pad` | **URL kept** | `cdn.jsdelivr.net` is an exact platform name |
+| `workers.dev` | **left out** | The suffix alone would block every Worker |
+| `https://evil-tenant.workers.dev/gate` | `evil-tenant.workers.dev` | The tenant hostname is the IOC |
 
 **Rule of thumb**
 
 - Dedicated malware host → keep the **hostname** (FQDN or IP).
-- Shared / household-name site (Google, Telegram, shorteners, many SaaS apps) → keep the **full URL**.
-- The tool never “climbs up” to a parent like `workers.dev` or `com`. It only uses the host that was actually in the URL.
+- Shared / household-name site (Google, Telegram, shorteners, many SaaS apps) with a path → keep the **full URL**.
+- That same site with no path → **leave it out**. `googleapis.com` and `storage.googleapis.com` are not written.
+- The tool never “climbs up” to a parent like `workers.dev` or `com`. It only uses the host that was actually in the URL. A line that is only `workers.dev` is left out. `evil-tenant.workers.dev` is written.
 
 ### What you will see in the terminal (besides the clean list)
 
@@ -268,29 +307,39 @@ kept URL (shared host t.me): https://t.me/+invitecodehere
 kept URL (shared host dictanote.co): https://dictanote.co/n/1393926
 kept URL (shared host dub.sh): dub.sh/6saehad
 
-Wrote 10 unique IOC(s) to ioc.txt  (collapsed URLs→host: 5, kept shared URLs: 3, other: 3)
+Wrote 10 unique IOC(s) to ioc.txt  (collapsed URLs→host: 5, kept URLs: 3, other: 3, refused platform names: 0)
 ```
 
-Read those “kept URL” lines before you push the list to the proxy. If a host should have been collapsed (or should have been kept), add or remove it from the shared-host list (below).
+A refused name looks like this, and it is **not** in the file:
+
+```text
+refused platform name: storage.googleapis.com
+```
+
+The script exits with an error status when it refuses any name, so a quick paste does not sail through. The other indicators are still written. Read the refused lines, then decide by hand if you really meant a narrower URL.
+
+Read the “kept URL” lines before you push the list to the proxy. If a host should have been collapsed (or should have been kept), add or remove it from the shared-host list (below).
 
 ### Shared hosts (“don’t turn this URL into just the domain”)
 
-Shipped file: **`shared_hosts.txt`** (shorteners, big tech, chat apps, common file hosts, plus some abused SaaS).  
+Shipped file: **`lists/shared_hosts.txt`** (shorteners, big tech, chat apps, common file hosts, plus some abused SaaS).  
 This is a **starter list we maintain here**, not an official internet feed. Edit it, or add **your** exceptions without touching the shipped file:
 
 ```text
-# shared_hosts.local.txt  (create this; it is gitignored)
+# lists/shared_hosts.local.txt  (create this; it is gitignored)
 your-company-saas.example
 ```
 
-One hostname per line. If the URL’s host **is** that name or a **subdomain** of it, the URL is kept.
+One hostname per line. If the URL’s host **is** that name or a **subdomain** of it, the URL is kept when it has a path. The hostname alone is left out.
+
+**Exact platform names** live in **`lists/never_block_exact.txt`** (`workers.dev`, `github.io`, `cdn.jsdelivr.net`, `blob.core.windows.net`, and a few others). Only that exact name is refused. `evil-tenant.workers.dev` is still written. A URL on the exact name is kept so the path can be blocked.
 
 ### Optional switches (you can ignore these)
 
 ```bash
 python3 ioc_txt_trimmer.py path/to/other_iocs.txt   # different file
 python3 ioc_txt_trimmer.py --keep-urls              # never collapse URLs (safest, noisiest)
-python3 ioc_txt_trimmer.py --hosts-only             # always collapse URLs (ignore the shared list)
+python3 ioc_txt_trimmer.py --hosts-only             # collapse URLs; platform names are still protected
 python3 ioc_txt_trimmer.py --shared-hosts extra.txt # merge another host list
 ```
 
@@ -309,7 +358,7 @@ You need the one-time VirusTotal setup in [First-time setup](#3-virustotal-only-
 ### 1. Create your working file (once)
 
 ```bash
-cp sha1_list.txt.example sha1_list.txt
+cp examples/sha1_list.txt.example sha1_list.txt
 ```
 
 (The filename is historical — MD5, SHA-1, and SHA-256 are all fine.)
@@ -345,7 +394,7 @@ Copy those into your ticket, EDR search, or `ioc.txt`.
 | A 64-character hex line prints | VT had that file; that is the SHA-256 |
 | `hash not found at VirusTotal: …` (on the error/status stream) | VT has no record (or the key/quota failed for that lookup) |
 | `Error: VT_API_KEY is not set` | `.env` is missing or the key line is still the placeholder — see setup above |
-| `Error: 'sha1_list.txt' not found` | You have not created the working file yet (`cp sha1_list.txt.example sha1_list.txt`) |
+| `Error: 'sha1_list.txt' not found` | You have not created the working file yet (`cp examples/sha1_list.txt.example sha1_list.txt`) |
 
 ### Optional switches (you can ignore these)
 
@@ -357,20 +406,13 @@ python3 get_sha256.py path/to/other_hashes.txt
 
 ## What’s in this folder
 
-You do **not** need to memorize this. It is only a map.
+The map is at the top, under [How the folder is laid out](#how-the-folder-is-laid-out).
 
-| Name | Role |
-|------|------|
-| `email_header_spoofing_analyzer.py` | Header triage tool |
-| `ioc_txt_trimmer.py` | IOC cleanup tool |
-| `get_sha256.py` | Hash → SHA-256 via VirusTotal |
-| `header.txt` / `ioc.txt` / `sha1_list.txt` | **Your** working data (not in git) |
-| `*.example` | Empty-ish templates you copy once |
-| `shared_hosts.txt` | Shipped “don’t collapse these sites to a hostname” list |
-| `shared_hosts.local.txt` | Optional extra hosts **you** add (not in git) |
-| `.env` | Your VirusTotal key (not in git) |
-| `.env.example` | Template for that key file |
-| `requirements.txt` | `pip install -r requirements.txt` (only for the VT helper) |
+Day to day you only touch the paste files in this folder and run one of the three `.py` tools. `examples/` is for the one-time copy. `lists/` is for the trimmer’s safety lists. `tests/` is for someone editing the scripts:
+
+```bash
+python3 -m unittest discover -s tests
+```
 
 ---
 

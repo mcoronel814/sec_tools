@@ -102,7 +102,7 @@ def main(argv: list[str] | None = None) -> int:
     except FileNotFoundError:
         print(
             f"Error: '{args.hash_file}' not found.\n"
-            f"  cp sha1_list.txt.example {args.hash_file}\n"
+            f"  cp examples/sha1_list.txt.example {args.hash_file}\n"
             "  Then paste hashes (one per line) and re-run.",
             file=sys.stderr,
         )

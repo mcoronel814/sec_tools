@@ -4,6 +4,10 @@
 # ioc_txt_trimmer.py keeps the full URL (so you don't block all of Telegram,
 # Google, a shortener, etc.).
 #
+# A line that is only the hostname (googleapis.com, storage.googleapis.com,
+# storage[.]googleapis[.]com) is left out of the IOC file. There is no path
+# to keep, and writing the name would block the whole service.
+#
 # This is a LOCAL curated list — there is no single official "don't block
 # these hosts" feed for this job. It is based on:
 #   - Common SOC practice (overblock collateral)
@@ -19,7 +23,7 @@
 #
 # Add one host per line. Lines starting with # are comments.
 # To customize without editing this file, use --shared-hosts PATH
-# or create shared_hosts.local.txt (merged on top; gitignored).
+# or create lists/shared_hosts.local.txt (merged on top; gitignored).
 
 # --- Messaging / social ---
 t.me

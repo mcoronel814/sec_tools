@@ -8,7 +8,8 @@ __pycache__/
 header.txt
 ioc.txt
 sha1_list.txt
-shared_hosts.local.txt
+org_watch.txt
+lists/shared_hosts.local.txt
 
 # Local env / secrets
 .env
